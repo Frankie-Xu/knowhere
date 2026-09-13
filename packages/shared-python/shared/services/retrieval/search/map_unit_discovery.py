@@ -417,6 +417,13 @@ async def map_unit_discovery(
     indexed_unit_count = sum(
         unit_count for _path_idf, _content_idf, unit_count, *_rest in index_parts
     )
+    # Equality against indexes.unit_count is only valid when unit_rows is the
+    # full inventory of those revisions. Image/table type filters, signal
+    # paths, and exclude_sections load a subset, so require the looser
+    # undercount check used for unfiltered token projection.
+    unit_rows_are_full_revision_inventory: bool = not (
+        type_clause or signal_paths or exclude_sections
+    )
     has_index_storage_mismatch: bool = False
     if is_unfiltered_scope and not unit_rows and expected_revisions:
         storage_counts: tuple[int | None, int | None] = cast(
@@ -451,13 +458,6 @@ async def map_unit_discovery(
         has_index_storage_mismatch = indexed_unit_count != int(
             actual_unit_count or 0
         ) or indexed_token_count != int(actual_token_count or 0)
-    # Equality against indexes.unit_count is only valid when unit_rows is the
-    # full inventory of those revisions. Image/table type filters, signal
-    # paths, and exclude_sections load a subset, so require the looser
-    # undercount check used for unfiltered token projection.
-    unit_rows_are_full_revision_inventory = not (
-        type_clause or signal_paths or exclude_sections
-    )
     has_index_unit_count_mismatch = (
         indexed_unit_count < len(unit_rows)
         if is_unfiltered_scope or not unit_rows_are_full_revision_inventory
