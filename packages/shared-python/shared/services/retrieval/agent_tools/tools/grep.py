@@ -13,6 +13,7 @@ duplicate window-slicing logic or drift to different constants.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -117,8 +118,6 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         .join(Document, Document.document_id == matched.c.document_id)
         .where(*scope_filters)
     )
-    total_matches = int((await ctx.db.execute(count_stmt)).scalar_one())
-
     rows_stmt = (
         select(
             matched.c.chunk_id,
@@ -135,7 +134,13 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         .order_by(matched.c.document_id, matched.c.sort_order)
         .limit(max_results)
     )
-    rows = (await ctx.db.execute(rows_stmt)).all()
+    async with ctx.db_factory() as rows_db:
+        count_result, rows_result = await asyncio.gather(
+            ctx.db.execute(count_stmt),
+            rows_db.execute(rows_stmt),
+        )
+    total_matches = int(count_result.scalar_one())
+    rows = rows_result.all()
 
     results: list[dict[str, Any]] = []
     for chunk_id, document_id, chunk_type, content, section_path, source_file_name in rows:

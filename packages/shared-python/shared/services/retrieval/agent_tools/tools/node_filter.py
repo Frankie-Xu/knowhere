@@ -127,11 +127,14 @@ async def node_filter(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         return ToolResult(text="", error="no active documents found for document_ids")
 
     revision_pairs = list(revision_by_doc.items())
+    scoped_document_ids = [document_id for document_id, _ in revision_pairs]
+    scoped_revision_ids = [revision_id for _, revision_id in revision_pairs]
     sections = (
         (
             await ctx.db.execute(
                 select(DocumentSection).where(
-                    DocumentSection.document_id.in_([d for d, _ in revision_pairs])
+                    DocumentSection.document_id.in_(scoped_document_ids),
+                    DocumentSection.job_result_id.in_(scoped_revision_ids),
                 )
             )
         )
@@ -148,8 +151,8 @@ async def node_filter(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     if chunk_types:
         chunk_rows = await ctx.db.execute(
             select(DocumentChunk.section_id, DocumentChunk.chunk_type).where(
-                DocumentChunk.document_id.in_([d for d, _ in revision_pairs]),
-                DocumentChunk.job_result_id.in_([r for _, r in revision_pairs]),
+                DocumentChunk.document_id.in_(scoped_document_ids),
+                DocumentChunk.job_result_id.in_(scoped_revision_ids),
             )
         )
         allowed_section_ids = {
