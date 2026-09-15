@@ -818,7 +818,8 @@ async def test_agent_explore_should_release_route_session_before_final_hydration
             events.append("final_db_close")
 
     class FakeHarness:
-        async def run_episode(self, **_kwargs: object) -> EpisodeResult:
+        async def run_episode(self, **kwargs: object) -> EpisodeResult:
+            assert kwargs["db_factory"] is retrieval_routes.open_agent_explore_database_context
             events.append("episode")
             assert events[:2] == ["route_rollback", "episode"]
             # Model an episode exceeding a simulated idle-in-transaction
