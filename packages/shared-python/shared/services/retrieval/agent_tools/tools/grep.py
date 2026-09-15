@@ -34,26 +34,6 @@ _DEFAULT_MAX_RESULTS = 30
 _DEFAULT_CONTEXT_CHARS = HIT_CONTEXT_CHARS
 
 
-def _build_scope_filters(
-    *,
-    user_id: str,
-    namespace: str,
-    document_ids: list[str],
-    chunk_types: set[str],
-) -> list[Any]:
-    filters: list[Any] = [
-        Document.user_id == user_id,
-        Document.namespace == namespace,
-        Document.status == "active",
-        Document.current_job_result_id == DocumentChunk.job_result_id,
-    ]
-    if document_ids:
-        filters.append(Document.document_id.in_(document_ids))
-    if chunk_types:
-        filters.append(func.lower(DocumentChunk.chunk_type).in_(sorted(chunk_types)))
-    return filters
-
-
 @register_tool(
     name="corpus.grep",
     description=(
@@ -97,41 +77,62 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     else:
         compiled = re.compile(re.escape(pattern), flags=re.IGNORECASE)
 
-    filters = _build_scope_filters(
-        user_id=ctx.user_id,
-        namespace=ctx.namespace,
-        document_ids=document_ids,
-        chunk_types=chunk_types,
-    )
-    filters.append(ctx.document_scope.predicate(Document.document_id))
     content_filter = (
         DocumentChunk.content.op("~*")(pattern)
         if is_regex
         else DocumentChunk.content.ilike(f"%{pattern}%")
     )
+    # Match content first so PostgreSQL can use idx_document_chunks_content_trgm.
+    # Joining documents first makes the planner filter every in-scope chunk
+    # and ignore the trigram index (observed: 31s vs 0.4s for the same count).
+    matched = select(
+        DocumentChunk.id,
+        DocumentChunk.chunk_id,
+        DocumentChunk.document_id,
+        DocumentChunk.job_result_id,
+        DocumentChunk.chunk_type,
+        DocumentChunk.content,
+        DocumentChunk.section_id,
+        DocumentChunk.sort_order,
+    ).where(DocumentChunk.content.is_not(None), content_filter)
+    if chunk_types:
+        matched = matched.where(
+            func.lower(DocumentChunk.chunk_type).in_(sorted(chunk_types))
+        )
+    matched = matched.cte("matched").prefix_with("MATERIALIZED")
+
+    scope_filters = [
+        Document.user_id == ctx.user_id,
+        Document.namespace == ctx.namespace,
+        Document.status == "active",
+        Document.current_job_result_id == matched.c.job_result_id,
+        ctx.document_scope.predicate(Document.document_id),
+    ]
+    if document_ids:
+        scope_filters.append(Document.document_id.in_(document_ids))
 
     count_stmt = (
-        select(func.count(DocumentChunk.id))
-        .select_from(DocumentChunk)
-        .join(Document, Document.document_id == DocumentChunk.document_id)
-        .where(*filters, content_filter)
+        select(func.count(matched.c.id))
+        .select_from(matched)
+        .join(Document, Document.document_id == matched.c.document_id)
+        .where(*scope_filters)
     )
     total_matches = int((await ctx.db.execute(count_stmt)).scalar_one())
 
     rows_stmt = (
         select(
-            DocumentChunk.chunk_id,
-            DocumentChunk.document_id,
-            DocumentChunk.chunk_type,
-            DocumentChunk.content,
+            matched.c.chunk_id,
+            matched.c.document_id,
+            matched.c.chunk_type,
+            matched.c.content,
             DocumentSection.section_path,
             Document.source_file_name,
         )
-        .select_from(DocumentChunk)
-        .join(Document, Document.document_id == DocumentChunk.document_id)
-        .outerjoin(DocumentSection, DocumentSection.section_id == DocumentChunk.section_id)
-        .where(*filters, content_filter)
-        .order_by(DocumentChunk.document_id, DocumentChunk.sort_order)
+        .select_from(matched)
+        .join(Document, Document.document_id == matched.c.document_id)
+        .outerjoin(DocumentSection, DocumentSection.section_id == matched.c.section_id)
+        .where(*scope_filters)
+        .order_by(matched.c.document_id, matched.c.sort_order)
         .limit(max_results)
     )
     rows = (await ctx.db.execute(rows_stmt)).all()
