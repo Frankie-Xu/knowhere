@@ -32,10 +32,13 @@ from shared.services.retrieval.scoring.node_filter_predicates import (
     name="corpus.node_filter",
     description=(
         "Deterministic FOR-ALL/EXISTS/ANY/NOT filter over section titles "
-        "(section_path) and summaries — not body text (use corpus.grep for "
-        "that). Predicates AND together across fields; terms within one "
-        "field's 'terms' list OR together. Returns the complete matched set "
-        "and its count, never a truncated top-K."
+        "and summaries — not body text (use corpus.grep for that). Call "
+        "with document_ids plus a predicates array; each predicate is "
+        "{field: 'path'|'summary', terms: [...], match: 'substring'|'regex'}. "
+        "field=path matches the section path; field=summary matches the "
+        "section summary. Predicates AND together across the array; terms "
+        "within one predicate's 'terms' list OR together. Returns the "
+        "complete matched set and its count, never a truncated top-K."
     ),
     json_schema={
         "type": "object",

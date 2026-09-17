@@ -35,30 +35,82 @@ _DEFAULT_MAX_RESULTS = 30
 _DEFAULT_CONTEXT_CHARS = HIT_CONTEXT_CHARS
 
 
+def _terms_from_args(args: dict[str, Any]) -> list[str]:
+    """Merge ``pattern`` (single) and ``patterns`` (list) into one ordered,
+    de-duplicated term list — see ``register_tool`` description above for
+    why both exist (collapsing what used to be several parallel
+    ``corpus.grep`` calls into one multi-term call)."""
+    single = str(args.get("pattern") or "").strip()
+    many = [str(p).strip() for p in (args.get("patterns") or []) if str(p).strip()]
+    seen: set[str] = set()
+    terms: list[str] = []
+    for term in ([single] if single else []) + many:
+        if term and term not in seen:
+            seen.add(term)
+            terms.append(term)
+    return terms
+
+
+def _content_search(
+    terms: list[str], *, is_regex: bool
+) -> tuple[re.Pattern[str], Any]:
+    """Build the Python matcher and the SQL content predicate for ``terms``.
+
+    One literal term stays on ``ILIKE`` (trgm-index path). Several terms, or
+    any regex call, become a ``~*`` alternation — ``ILIKE`` has no OR form.
+    """
+    if is_regex:
+        combined = "|".join(f"(?:{term})" for term in terms)
+        compiled = re.compile(combined, flags=re.IGNORECASE)
+        return compiled, DocumentChunk.content.op("~*")(combined)
+    if len(terms) == 1:
+        compiled = re.compile(re.escape(terms[0]), flags=re.IGNORECASE)
+        return compiled, DocumentChunk.content.ilike(f"%{terms[0]}%")
+    combined = "|".join(re.escape(term) for term in terms)
+    compiled = re.compile(combined, flags=re.IGNORECASE)
+    return compiled, DocumentChunk.content.op("~*")(combined)
+
+
 @register_tool(
     name="corpus.grep",
     description=(
         "Exact string or regex search against chunk body text (content), "
         "not titles/summaries (use corpus.node_filter for that). Returns the "
-        "total number of matching chunks plus a capped list of snippets."
+        "total number of matching chunks plus a capped list of snippets. "
+        "Provide 'pattern' for one term, or 'patterns' for several candidate "
+        "terms OR'd together in this single call (e.g. synonyms) — issue one "
+        "call with multiple terms instead of several parallel corpus.grep "
+        "calls for different terms in the same turn. At least one of "
+        "pattern/patterns is required."
     ),
     json_schema={
         "type": "object",
         "properties": {
-            "pattern": {"type": "string"},
+            "pattern": {
+                "type": "string",
+                "description": "One search term (string or regex per is_regex).",
+            },
+            "patterns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Several search terms OR'd together in this one call.",
+            },
             "document_ids": {"type": "array", "items": {"type": "string"}},
             "chunk_types": {"type": "array", "items": {"type": "string"}},
             "is_regex": {"type": "boolean", "default": False},
             "context_chars": {"type": "integer", "default": _DEFAULT_CONTEXT_CHARS},
             "max_results": {"type": "integer", "default": _DEFAULT_MAX_RESULTS},
         },
-        "required": ["pattern"],
+        "anyOf": [
+            {"required": ["pattern"]},
+            {"required": ["patterns"]},
+        ],
     },
 )
 async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-    pattern = str(args.get("pattern") or "").strip()
-    if not pattern:
-        return ToolResult(text="", error="grep requires pattern")
+    terms = _terms_from_args(args)
+    if not terms:
+        return ToolResult(text="", error="grep requires pattern or patterns")
     is_regex = bool(args.get("is_regex", False))
     context_chars = int(args.get("context_chars") or _DEFAULT_CONTEXT_CHARS)
     requested_max_results = int(args.get("max_results") or _DEFAULT_MAX_RESULTS)
@@ -70,19 +122,10 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         str(t).strip().lower() for t in (args.get("chunk_types") or []) if str(t).strip()
     }
 
-    if is_regex:
-        try:
-            compiled = re.compile(pattern, flags=re.IGNORECASE)
-        except re.error as exc:
-            return ToolResult(text="", error=f"invalid regex: {exc}")
-    else:
-        compiled = re.compile(re.escape(pattern), flags=re.IGNORECASE)
-
-    content_filter = (
-        DocumentChunk.content.op("~*")(pattern)
-        if is_regex
-        else DocumentChunk.content.ilike(f"%{pattern}%")
-    )
+    try:
+        compiled, content_filter = _content_search(terms, is_regex=is_regex)
+    except re.error as exc:
+        return ToolResult(text="", error=f"invalid regex: {exc}")
     # Match content first so PostgreSQL can use idx_document_chunks_content_trgm.
     # Joining documents first makes the planner filter every in-scope chunk
     # and ignore the trigram index (observed: 31s vs 0.4s for the same count).
