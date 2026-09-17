@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -18,17 +17,15 @@ ensure_import_paths()
 
 from app.services.document_ingestion.creation_service import (  # noqa: E402
     DocumentIngestionCreationService,
+    ResolvedDocumentIngestionScope,
 )
 from app.services.document_ingestion.scope_service import (  # noqa: E402
     find_active_document_by_source_file_name,
 )
-from app.services.document_ingestion.service import (  # noqa: E402
-    DocumentIngestionService,
-)
 from app.services.rate_limit.data_structures import CurrentUser  # noqa: E402
 from shared.core.exceptions.domain_exceptions import ConflictException  # noqa: E402
 from shared.models.database.document import Document  # noqa: E402
-from shared.models.schemas.job import JobCreate, JobCreateV2  # noqa: E402
+from shared.models.schemas.job import JobCreate  # noqa: E402
 
 
 USER_ID = "user_dup"
@@ -45,11 +42,6 @@ class _AsyncSessionAdapter:
 
     async def execute(self, statement):  # noqa: ANN001
         return self._session.execute(statement)
-
-
-class _NoAdmission:
-    async def enforce_job_creation_capacity(self, **_kwargs: object) -> None:
-        return None
 
 
 def _seed_document(
@@ -92,45 +84,37 @@ def db_session() -> Session:
     return session
 
 
-def _service() -> DocumentIngestionService:
-    return DocumentIngestionService(
-        creation_service=DocumentIngestionCreationService(),
-        job_admission_service=_NoAdmission(),  # type: ignore[arg-type]
+def _file_payload(*, document_id: str | None = None) -> JobCreate:
+    payload: dict[str, str] = {
+        "source_type": "file",
+        "file_name": FILE_NAME,
+        "namespace": NAMESPACE,
+    }
+    if document_id:
+        payload["document_id"] = document_id
+    return JobCreate.model_validate(payload)
+
+
+def _scope() -> ResolvedDocumentIngestionScope:
+    return ResolvedDocumentIngestionScope(
+        job_metadata={},
+        document_id="doc_newscope01",
+        namespace=NAMESPACE,
     )
 
 
-def _file_payload(*, namespace: str = NAMESPACE) -> JobCreate:
-    return JobCreate.model_validate(
-        {
-            "source_type": "file",
-            "file_name": FILE_NAME,
-            "namespace": namespace,
-        }
-    )
-
-
-async def _create_job(
-    service: DocumentIngestionService,
+async def _reject(
     db_session: Session,
     *,
-    api_version: str,
     payload: JobCreate,
 ) -> None:
-    request: JobCreate | JobCreateV2 = (
-        JobCreateV2.model_validate(payload.model_dump())
-        if api_version == "v2"
-        else payload
+    await DocumentIngestionCreationService()._reject_duplicate_source_file_name(
+        _AsyncSessionAdapter(db_session),  # type: ignore[arg-type]
+        payload=payload,
+        current_user=CurrentUser(user_id=USER_ID, user_tier="pro"),
+        scope=_scope(),
+        source_file_name=FILE_NAME,
     )
-    create = service.create_v2_job if api_version == "v2" else service.create_v1_job
-    with patch(
-        "app.services.document_ingestion.service.find_active_job_for_document",
-        new=AsyncMock(return_value=None),
-    ):
-        await create(
-            _AsyncSessionAdapter(db_session),  # type: ignore[arg-type]
-            payload=request,
-            current_user=CurrentUser(user_id=USER_ID, user_tier="pro"),
-        )
 
 
 @pytest.mark.asyncio
@@ -198,20 +182,12 @@ async def test_find_ignores_other_user_other_namespace_archived_and_case(
     assert archived is None
 
 
-@pytest.mark.parametrize("api_version", ["v1", "v2"])
 @pytest.mark.asyncio
-async def test_create_job_rejects_duplicate_file_name_without_document_id(
+async def test_reject_duplicate_file_name_without_document_id(
     db_session: Session,
-    api_version: str,
 ) -> None:
-    service = _service()
     with pytest.raises(ConflictException) as caught:
-        await _create_job(
-            service,
-            db_session,
-            api_version=api_version,
-            payload=_file_payload(),
-        )
+        await _reject(db_session, payload=_file_payload())
     error = caught.value
     assert error.details == {
         "reason": "ALREADY_EXISTS",
@@ -224,3 +200,8 @@ async def test_create_job_rejects_duplicate_file_name_without_document_id(
     )
 
 
+@pytest.mark.asyncio
+async def test_reject_skips_when_document_id_is_provided(
+    db_session: Session,
+) -> None:
+    await _reject(db_session, payload=_file_payload(document_id=EXISTING_DOC))
