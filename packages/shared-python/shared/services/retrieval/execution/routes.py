@@ -228,7 +228,7 @@ async def _run_agent_explore_route(
     # be reused for post-episode database work.
     await context.db.rollback()
 
-    harness = resolve_harness()
+    harness = resolve_harness(cursor_model=context.agent_explore_model)
     episode_started = time.perf_counter()
     episode = await harness.run_episode(
         db_factory=open_agent_explore_database_context,
