@@ -109,7 +109,7 @@ A: MinerU remains the default raw PDF extractor for Knowhere's V1 chunk-based pi
 
 **Q: What LLM / VLM dependencies does Knowhere have?**
 
-A: We recommend [`deepseek-v4-flash-vision-exp`](https://api-docs.deepseek.com/guides/vision/) as a unified model for both Text and Vision workloads. It accepts text and image input, so the same model can handle summarization, hierarchy reasoning, page understanding, and asset descriptions. The model is currently experimental, and Knowhere remains model-agnostic: you can use another model—or separate Text and Vision models—from OpenAI, Qwen, GLM, Volcengine, or any compatible provider.
+A: We recommend [`deepseek-flash`](https://api-docs.deepseek.com/guides/vision/) as a unified model for both Text and Vision workloads. It accepts text and image input, so the same model can handle summarization, hierarchy reasoning, page understanding, and asset descriptions. Knowhere remains model-agnostic: you can use another model—or separate Text and Vision models—from OpenAI, Qwen, GLM, Volcengine, or any compatible provider.
 
 **Q: How is Agentic Retrieval different from traditional RAG?**
 
