@@ -365,7 +365,6 @@ def _document_profile_from_dict(data: dict[str, Any] | None):
         category=str(raw.get("category") or "unknown"),
         routing_category=str(raw.get("routing_category") or "generic"),
         language=str(raw.get("language") or "unknown"),
-        rationale=str(raw.get("rationale") or ""),
         header_y=raw.get("header_y"),
         footer_y=raw.get("footer_y"),
     )
