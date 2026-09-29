@@ -125,10 +125,8 @@ for anything finer-grained than a document pair.
 
 ## 5. Reserved / not yet available
 
-- **Vector channel**: `recall`'s `channels` parameter reserves a `vector`
-  option; it does not exist yet. `recall` today fuses two lexical channels
-  (`path_content`: persisted map-unit BM25 over path+content; `term`:
-  substring match over `document_map_units.term_search_text_lower`) via RRF.
+- **Vector**: not available yet. `recall` today is path + content BM25.
+  Exact-string lookup is `grep`.
 
 ## 6. Tools and how they work together
 

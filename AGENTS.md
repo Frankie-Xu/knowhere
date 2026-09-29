@@ -578,7 +578,7 @@ flowchart LR
 
 There is no scored term channel in this primary path. `term_search_text` /
 `term_search_text_lower` are persisted at publish time and are read by
-`corpus.recall`'s term channel, not by classic discovery.
+`corpus.grep`, not by classic discovery.
 
 #### Agent-explore Mode (default)
 

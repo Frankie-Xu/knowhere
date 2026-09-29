@@ -12,9 +12,7 @@ targets, are mounted through the shared explore mount so the tool result
 includes rendered table/image content.
 
 Snippets are built by the shared ``agent_tools.snippet.build_snippet`` (head
-+ first-match window + tail, ``...``-joined, overlap-merged) — the same
-mechanism ``corpus.recall``'s term channel uses, so the two tools don't carry
-duplicate window-slicing logic or drift to different constants. Rows render
++ first-match window + tail, ``...``-joined, overlap-merged). Rows render
 through the shared ``agent_tools.snippet.format_row`` — the same row shape
 ``corpus.outline``/``corpus.node_filter``/``corpus.recall``/``corpus.assets``
 use, so a model reads one shape regardless of which tool produced it.

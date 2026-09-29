@@ -142,11 +142,7 @@ async def test_scope_matrix_all_corpus_tools_and_refs(developer_api_client_facto
             for name, args in [
                 ("list_documents", {}),
                 ("grep", {"pattern": "scopeprobe"}),
-                ("recall", {"query": "scopeprobe", "channels": ["term"], "limit": 50}),
-                (
-                    "recall",
-                    {"query": "scopeprobe", "channels": ["path_content"], "limit": 50},
-                ),
+                ("recall", {"query": "scopeprobe", "limit": 50}),
                 ("assets", {}),
                 (
                     "assets",
