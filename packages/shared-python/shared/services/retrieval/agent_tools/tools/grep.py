@@ -239,8 +239,8 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         .order_by(matched.c.document_id, matched.c.sort_order)
         .limit(limit)
     )
-    rows = (await ctx.db.execute(rows_stmt)).all()
-    total_matches = int(rows[0][-1]) if rows else 0
+    matched_rows = (await ctx.db.execute(rows_stmt)).all()
+    total_matches = int(matched_rows[0][-1]) if matched_rows else 0
 
     results: list[dict[str, Any]] = []
     for (
@@ -256,7 +256,7 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         section_path,
         source_file_name,
         _total_matches,
-    ) in rows:
+    ) in matched_rows:
         text = str(term_search_text or "")
         match = compiled.search(text)
         snippet = build_snippet(
