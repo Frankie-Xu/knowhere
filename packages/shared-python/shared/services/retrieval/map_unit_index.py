@@ -162,9 +162,6 @@ def replace_document_map_units(
                     "unit_kind": str(unit.get("kind") or "leaf"),
                     "path_token_count": len(path_tokens),
                     "content_token_count": len(content_tokens),
-                    "term_search_text_lower": str(
-                        unit.get("term_search_text") or ""
-                    ).lower(),
                     "has_image": "image" in section_types,
                     "has_table": "table" in section_types,
                     "sort_order": sort_order,
