@@ -150,8 +150,8 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     terms = _terms_from_args(args)
     if not terms:
         return ToolResult(text="", error="grep requires pattern or patterns")
-    context_chars = int(args.get("context_chars") or _DEFAULT_CONTEXT_CHARS)
-    requested_limit = int(args.get("limit") or _DEFAULT_LIMIT)
+    context_chars = int(args.get("context_chars", _DEFAULT_CONTEXT_CHARS))
+    requested_limit = int(args.get("limit", _DEFAULT_LIMIT))
     limit = capped_limit(requested_limit, ctx.budget)
     chunk_types = {
         str(t).strip().lower() for t in (args.get("chunk_types") or []) if str(t).strip()

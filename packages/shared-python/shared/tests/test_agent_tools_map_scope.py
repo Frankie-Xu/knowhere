@@ -20,7 +20,11 @@ from sqlalchemy.orm import Session
 
 from shared.models.database.document import Document, DocumentChunk, DocumentSection
 from shared.models.database.job_result import JobResult
-from shared.services.retrieval.agent_tools.registry import MAP_TOOL_CHAR_BUDGET, ToolContext
+from shared.services.retrieval.agent_tools.registry import (
+    MAP_TOOL_CHAR_BUDGET,
+    ToolContext,
+    ToolResult,
+)
 from shared.services.retrieval.agent_tools.tools.assets import assets
 from shared.services.retrieval.agent_tools.tools.grep import grep
 from shared.services.retrieval.agent_tools.tools.node_filter import node_filter
@@ -28,6 +32,27 @@ from shared.services.retrieval.agent_tools.tools.outline import outline
 from shared.services.retrieval.agent_tools.tools.recall import recall
 from shared.services.retrieval.search.map_unit_discovery import DiscoveryResult
 from shared.services.retrieval.scoring.map_lighting import MapNode, fold_map_nodes
+
+_ROW_KEYS = {
+    "kind",
+    "title",
+    "document_id",
+    "section_path",
+    "chunk_id",
+    "summary",
+    "snippet",
+    "score",
+    "is_hit",
+    "depth",
+    "hosted",
+}
+
+
+def _assert_shared_search_payload(result: ToolResult) -> None:
+    assert set(result.payload) == {"rows", "details"}
+    assert isinstance(result.payload["details"], dict)
+    for row in result.payload["rows"]:
+        assert set(row) == _ROW_KEYS
 
 USER_ID = "user_map"
 NAMESPACE = "default"
@@ -262,7 +287,8 @@ async def test_outline_accepts_several_scope_targets(map_ctx: ToolContext) -> No
         {"scope": [{"document_id": DOC_A}, {"document_id": DOC_B}]},
     )
     assert result.error is None
-    paths = {row["section_path"] for row in result.payload["sections"]}
+    _assert_shared_search_payload(result)
+    paths = {row["section_path"] for row in result.payload["rows"]}
     assert PATH_OVERVIEW in paths
     assert PATH_INTRO in paths
     assert "| document_id=" in result.text
@@ -286,7 +312,8 @@ async def test_node_filter_keeps_ancestors_and_full_descendant_subtree(
     assert PATH_OVERVIEW in result.text
     assert PATH_DETAIL in result.text
     assert PATH_TREATMENT not in result.text
-    hits = result.payload["matched_sections"]
+    _assert_shared_search_payload(result)
+    hits = [row for row in result.payload["rows"] if row["is_hit"]]
     assert [row["section_path"] for row in hits] == [PATH_FINDINGS]
 
 
@@ -361,7 +388,8 @@ async def test_grep_subtree_scope_excludes_sibling_sections(map_ctx: ToolContext
         },
     )
     assert result.error is None
-    chunk_ids = [row["chunk_id"] for row in result.payload["results"]]
+    _assert_shared_search_payload(result)
+    chunk_ids = [ref["chunk_id"] for ref in result.refs]
     assert "chunk_findings" in chunk_ids
     assert "chunk_detail" in chunk_ids
     assert "chunk_treatment" not in chunk_ids
@@ -377,7 +405,8 @@ async def test_assets_subtree_scope_keeps_only_connected_in_scope_assets(
         {"scope": [{"document_id": DOC_A, "section_path": PATH_OVERVIEW}], "type": "table"},
     )
     assert result.error is None
-    chunk_ids = [row["chunk_id"] for row in result.payload["assets"]]
+    _assert_shared_search_payload(result)
+    chunk_ids = [row["chunk_id"] for row in result.payload["rows"]]
     assert chunk_ids == ["chunk_table_overview"]
     assert "chunk_table_treatment" not in result.text
 

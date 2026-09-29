@@ -72,12 +72,20 @@ class _GrepRows:
         ]
 
 
+class _EmptyHostRows:
+    def all(self) -> list[tuple[object, ...]]:
+        return []
+
+
 class _RecordingDb:
-    def __init__(self, result: object) -> None:
-        self.result = result
+    def __init__(self, results: object) -> None:
+        self.results = list(results) if isinstance(results, list) else [results]
+        self._index = 0
 
     async def execute(self, statement):  # noqa: ANN001
-        return self.result
+        result = self.results[min(self._index, len(self.results) - 1)]
+        self._index += 1
+        return result
 
 
 @asynccontextmanager
@@ -199,7 +207,7 @@ def _read_kwargs(refs: list[dict[str, str]]) -> dict:
 
 
 def _section_paths_from_outline_text(text: str) -> list[str]:
-    return re.findall(r"section_path=(.+?)(?: \[Hit\])?$", text, re.MULTILINE)
+    return re.findall(r"section_path=(.+)$", text, re.MULTILINE)
 
 
 def _asset_refs_from_text(text: str) -> list[dict[str, str]]:
@@ -232,11 +240,8 @@ async def test_assets_visible_chunk_id_reads(discovery_ctx: ToolContext) -> None
         discovery_ctx, {"scope": [{"document_id": DOC_ID}], "type": "table"}
     )
     assert listed.error is None
-    # file_path is not part of the shared row shape (format_row) any of the
-    # five search/map tools render — only chunk_id is a valid read()
-    # identifier (see test_file_path_is_not_a_readable_chunk_id below), so
-    # the payload (not the text) is where file_path still lives.
-    assert listed.payload["assets"][0]["file_path"] == TABLE_FILE
+    assert listed.payload["rows"][0]["chunk_id"] == CHUNK_TABLE
+    assert listed.payload["rows"][0]["kind"] == "table"
     refs = _asset_refs_from_text(listed.text)
     assert refs == [{"document_id": DOC_ID, "chunk_id": CHUNK_TABLE}]
     result = await read(discovery_ctx, _read_kwargs(refs))
@@ -248,7 +253,7 @@ async def test_assets_visible_chunk_id_reads(discovery_ctx: ToolContext) -> None
 @pytest.mark.asyncio
 async def test_grep_table_visible_chunk_id_reads(discovery_ctx: ToolContext) -> None:
     grep_ctx = ToolContext(
-        db=_RecordingDb(_GrepRows()),  # type: ignore[arg-type]
+        db=_RecordingDb([_GrepRows(), _EmptyHostRows()]),  # type: ignore[arg-type]
         user_id=USER_ID,
         namespace=NAMESPACE,
         db_factory=_unused_db_factory,

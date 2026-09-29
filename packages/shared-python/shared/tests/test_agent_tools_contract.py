@@ -16,7 +16,7 @@ import pytest
 
 from shared.services.retrieval.agent_explore.config import FINISH_TOOL_SCHEMA
 from shared.services.retrieval.agent_tools import REGISTRY, ToolContext, load_corpus_schema_text
-from shared.services.retrieval.agent_tools.snippet import format_row
+from shared.services.retrieval.agent_tools.snippet import build_row, format_row
 
 
 @asynccontextmanager
@@ -159,13 +159,100 @@ def test_old_parameter_names_are_absent_from_docs_and_descriptions() -> None:
             assert stale not in spec.json_schema.get("properties", {})
 
 
+_ROW_KEYS = {
+    "kind",
+    "title",
+    "document_id",
+    "section_path",
+    "chunk_id",
+    "summary",
+    "snippet",
+    "score",
+    "is_hit",
+    "depth",
+    "hosted",
+}
+
+
 def test_format_row_is_the_shared_search_line() -> None:
-    line = format_row(
+    row = build_row(
         kind="text",
         document_id="doc_a",
         section_path="guide.pdf / Intro",
         title="guide.pdf",
         snippet="hello",
     )
+    assert set(row) == _ROW_KEYS
+    line = format_row(row)
     assert line.startswith("- [text] guide.pdf | document_id=doc_a section_path=")
     assert "snippet:" in line
+
+
+@pytest.mark.asyncio
+async def test_chunk_types_enum_rejects_old_names() -> None:
+    result = await REGISTRY.dispatch(
+        "corpus.grep",
+        _ctx(),
+        {"pattern": "x", "chunk_types": ["body"]},
+    )
+    assert result.error is not None
+    assert "chunk_types" in result.error
+    assert "unknown argument" not in result.error
+
+
+@pytest.mark.asyncio
+async def test_limit_below_minimum_is_rejected() -> None:
+    result = await REGISTRY.dispatch(
+        "corpus.grep",
+        _ctx(),
+        {"pattern": "x", "limit": 0},
+    )
+    assert result.error is not None
+    assert "limit" in result.error
+
+
+@pytest.mark.asyncio
+async def test_recall_blank_query_is_rejected() -> None:
+    result = await REGISTRY.dispatch("corpus.recall", _ctx(), {"query": "   "})
+    assert result.error == "recall requires query"
+
+
+@pytest.mark.asyncio
+async def test_read_ref_requires_exactly_one_address() -> None:
+    both = await REGISTRY.dispatch(
+        "corpus.read",
+        _ctx(),
+        {
+            "refs": [
+                {
+                    "document_id": "doc_a",
+                    "section_path": "guide.pdf / Intro",
+                    "chunk_id": "chunk_a",
+                }
+            ]
+        },
+    )
+    assert both.error is not None
+    assert "section_path" in both.error
+    assert "chunk_id" in both.error
+
+    neither = await REGISTRY.dispatch(
+        "corpus.read",
+        _ctx(),
+        {"refs": [{"document_id": "doc_a"}]},
+    )
+    assert neither.error is not None
+    assert "section_path" in neither.error or "chunk_id" in neither.error
+
+
+def test_chunk_types_and_bounds_are_in_schema() -> None:
+    grep = REGISTRY.get("corpus.grep")
+    recall = REGISTRY.get("corpus.recall")
+    outline = REGISTRY.get("corpus.outline")
+    assert grep is not None and recall is not None and outline is not None
+    for spec in (grep, recall):
+        items = spec.json_schema["properties"]["chunk_types"]["items"]
+        assert items["enum"] == ["text", "page", "image", "table"]
+        assert spec.json_schema["properties"]["limit"]["minimum"] == 1
+    assert grep.json_schema["properties"]["context_chars"]["minimum"] == 1
+    assert outline.json_schema["properties"]["depth"]["minimum"] == 0

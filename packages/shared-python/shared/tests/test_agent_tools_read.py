@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from shared.models.database.document import Document, DocumentChunk, DocumentSection
 from shared.models.database.job_result import JobResult
 from shared.services.retrieval.agent_tools.registry import ToolContext
-from shared.services.retrieval.agent_tools.tools.read import read
+from shared.services.retrieval.agent_tools.tools.read import _PICK_REMINDER, read
 
 USER_ID = "user_read"
 NAMESPACE = "default"
@@ -273,7 +273,9 @@ def _assert_result(
 ) -> None:
     assert result.error is None
     expected_text = (
-        f"{_refs_text(ref_status)}\n{body_text}" if body_text else _refs_text(ref_status)
+        f"{_refs_text(ref_status)}\n{_PICK_REMINDER}\n{body_text}\n{_PICK_REMINDER}"
+        if body_text
+        else f"{_refs_text(ref_status)}\n{_PICK_REMINDER}"
     )
     assert result.text == expected_text
     assert result.payload["refs"] == ref_status

@@ -136,7 +136,9 @@ async def test_read_partial_failure_status_is_in_payload_and_trace(
     assert "unknown chunk_id" in statuses[1]["reason"]
     assert result.refs == [{"document_id": DOC_A, "chunk_id": CHUNK_INTRO}]
 
-    observation = tool_message_content(result, max_chars=12_000)
+    observation = tool_message_content(
+        result, tool_name="corpus.read", max_chars=12_000
+    )
     assert "[ok]" in observation
     assert "[failed: unknown chunk_id: missing_chunk in doc_a]" in observation
 
@@ -151,11 +153,13 @@ async def test_read_partial_failure_status_is_in_payload_and_trace(
                 elapsed_ms=1,
                 tokens_used_delta=0,
                 tokens_used_total=0,
+                ref_status=result.payload["refs"],
             )
         ]
     )
     recorded = trace[0].observation["observation_text"]
     assert "[ok]" in recorded
     assert "[failed: unknown chunk_id: missing_chunk in doc_a]" in recorded
+    assert trace[0].observation["ref_status"] == result.payload["refs"]
     assert trace[0].result["status"] == "ok"
     assert trace[0].result["error"] is None

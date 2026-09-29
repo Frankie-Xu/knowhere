@@ -19,7 +19,7 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from shared.services.retrieval.agent_tools.registry import REGISTRY, ToolContext
-from shared.services.retrieval.agent_tools.snippet import format_row
+from shared.services.retrieval.agent_tools.snippet import build_row, format_row
 from shared.services.retrieval.agent_tools.tools.grep import (
     _term_search,
     _terms_from_args,
@@ -158,8 +158,9 @@ async def test_grep_runs_one_scoped_query_with_exact_total() -> None:
     result = await grep(ctx, {"pattern": "HFrEF"})
 
     assert result.error is None
-    assert result.payload["total_matches"] == 2
-    assert [row["chunk_id"] for row in result.payload["results"]] == ["chunk_a", "chunk_b"]
+    assert result.payload["details"]["total_matches"] == 2
+    assert [row["document_id"] for row in result.payload["rows"]] == ["doc_a", "doc_a"]
+    assert [row["chunk_id"] for row in result.payload["rows"]] == [None, None]
     assert result.refs == [
         {"document_id": "doc_a", "chunk_id": "chunk_a"},
         {"document_id": "doc_a", "chunk_id": "chunk_b"},
@@ -259,8 +260,8 @@ async def test_grep_exact_total_survives_row_limit() -> None:
     )
     result = await grep(ctx, {"pattern": "HFrEF", "limit": 1})
 
-    assert result.payload["total_matches"] == 2
-    assert len(result.payload["results"]) == 1
+    assert result.payload["details"]["total_matches"] == 2
+    assert len(result.payload["rows"]) == 1
     assert result.text.startswith("total_matches=2 returned=1")
 
 
@@ -281,7 +282,8 @@ async def test_grep_empty_result_reports_zero_total() -> None:
     )
     result = await grep(ctx, {"pattern": "missing"})
 
-    assert result.payload == {"total_matches": 0, "results": []}
+    assert result.payload["rows"] == []
+    assert result.payload["details"]["total_matches"] == 0
     assert result.refs == []
     assert result.text == "total_matches=0 returned=0"
 
@@ -396,7 +398,7 @@ class _TableRowsResult:
 async def test_grep_table_hit_text_includes_chunk_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    db = _SequencedDb([_TableRowsResult()])
+    db = _SequencedDb([_TableRowsResult(), _EmptyRowsResult()])
 
     @asynccontextmanager
     async def unused_factory():
@@ -418,7 +420,7 @@ async def test_grep_table_hit_text_includes_chunk_id(
     assert result.error is None
     assert (
         "- [table] guide.pdf | document_id=doc_a section_path=guide.pdf / Root "
-        "chunk_id=chunk_table"
+        "(no host section) chunk_id=chunk_table"
         in result.text
     )
     assert "<table>" in result.text
@@ -435,7 +437,7 @@ async def test_grep_table_download_failure_does_not_fail_whole_call(
     warning note instead of raising."""
     from shared.services.retrieval.hydration.table_grid import TableDownloadError
 
-    db = _SequencedDb([_TableRowsResult()])
+    db = _SequencedDb([_TableRowsResult(), _EmptyRowsResult()])
 
     @asynccontextmanager
     async def unused_factory():
@@ -458,7 +460,7 @@ async def test_grep_table_download_failure_does_not_fail_whole_call(
     result = await grep(ctx, {"pattern": "30 mg"})
 
     assert result.error is None
-    assert result.payload["total_matches"] == 1
+    assert result.payload["details"]["total_matches"] == 1
     assert "table unavailable" in result.text
     assert "download failed" in result.text
 
@@ -467,7 +469,7 @@ async def test_grep_table_download_failure_does_not_fail_whole_call(
 async def test_grep_matches_table_via_term_search_text_not_content_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    db = _SequencedDb([_TableRowsResult()])
+    db = _SequencedDb([_TableRowsResult(), _EmptyRowsResult()])
 
     @asynccontextmanager
     async def unused_factory():
@@ -487,40 +489,52 @@ async def test_grep_matches_table_via_term_search_text_not_content_path(
     result = await grep(ctx, {"pattern": "dose table summary"})
 
     assert result.error is None
-    assert result.payload["total_matches"] == 1
-    assert result.payload["results"][0]["chunk_id"] == "chunk_table"
+    assert result.payload["details"]["total_matches"] == 1
+    assert result.payload["rows"][0]["chunk_id"] == "chunk_table"
     assert "dose table summary" in result.text
 
 
 def test_format_row_body_omits_chunk_id() -> None:
     assert format_row(
-        kind="text",
-        document_id="doc_a",
-        section_path="guide.pdf / Intro",
-        title="guide.pdf",
-        snippet="alpha",
-    ) == "- [text] guide.pdf | document_id=doc_a section_path=guide.pdf / Intro\n  snippet: 'alpha'"
+        build_row(
+            kind="text",
+            document_id="doc_a",
+            section_path="guide.pdf / Intro",
+            title="guide.pdf",
+            snippet="alpha",
+        )
+    ) == (
+        "- [text] guide.pdf | document_id=doc_a section_path=guide.pdf / Intro\n"
+        "  snippet: 'alpha'"
+    )
 
 
 def test_format_row_omits_empty_snippet() -> None:
-    assert format_row(
-        kind="table",
-        document_id="doc_a",
-        section_path="guide.pdf / Root",
-        title="guide.pdf",
-        chunk_id="chunk_table",
-    ) == "- [table] guide.pdf | document_id=doc_a section_path=guide.pdf / Root chunk_id=chunk_table"
+    assert (
+        format_row(
+            build_row(
+                kind="table",
+                document_id="doc_a",
+                section_path="guide.pdf / Root",
+                title="guide.pdf",
+                chunk_id="chunk_table",
+            )
+        )
+        == "- [table] guide.pdf | document_id=doc_a section_path=guide.pdf / Root chunk_id=chunk_table"
+    )
 
 
 def test_format_row_asset_includes_chunk_id_and_score() -> None:
     assert format_row(
-        kind="table",
-        document_id="doc_a",
-        section_path="guide.pdf / Root",
-        title="guide.pdf",
-        chunk_id="chunk_table",
-        snippet="30 mg",
-        score=1.5,
+        build_row(
+            kind="table",
+            document_id="doc_a",
+            section_path="guide.pdf / Root",
+            title="guide.pdf",
+            chunk_id="chunk_table",
+            snippet="30 mg",
+            score=1.5,
+        )
     ) == (
         "- [table] guide.pdf | document_id=doc_a section_path=guide.pdf / Root "
         "chunk_id=chunk_table score=1.5\n  snippet: '30 mg'"
@@ -548,7 +562,7 @@ async def test_grep_matches_image_description() -> None:
                 )
             ]
 
-    db = _SequencedDb([_ImageRows()])
+    db = _SequencedDb([_ImageRows(), _EmptyRowsResult()])
 
     @asynccontextmanager
     async def unused_factory():
@@ -563,7 +577,7 @@ async def test_grep_matches_image_description() -> None:
     )
     result = await grep(ctx, {"pattern": "chart of dose"})
     assert result.error is None
-    assert result.payload["results"][0]["chunk_id"] == "chunk_image"
+    assert result.payload["rows"][0]["chunk_id"] == "chunk_image"
     assert "chart of dose" in result.text
     assert "[Image:" in result.text
 
@@ -587,5 +601,5 @@ async def test_grep_scope_does_not_scan_table_cells() -> None:
         ctx, {"pattern": "30 mg", "scope": [{"document_id": "doc_a"}]}
     )
     assert db.execute_count == 2
-    assert result.payload["total_matches"] == 0
+    assert result.payload["details"]["total_matches"] == 0
     assert "cell=" not in result.text

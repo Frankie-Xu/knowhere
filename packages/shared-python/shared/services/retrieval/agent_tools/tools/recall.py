@@ -92,7 +92,7 @@ async def recall(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     query = str(args.get("query") or "").strip()
     if not query:
         return ToolResult(text="", error="recall requires query")
-    requested_limit = int(args.get("limit") or _DEFAULT_LIMIT)
+    requested_limit = int(args.get("limit", _DEFAULT_LIMIT))
     limit = capped_limit(requested_limit, ctx.budget)
     chunk_types = {
         str(t).strip().lower() for t in (args.get("chunk_types") or []) if str(t).strip()
