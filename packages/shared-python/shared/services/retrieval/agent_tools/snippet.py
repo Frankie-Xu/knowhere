@@ -4,16 +4,19 @@
 window + tail, ``...``-joined, overlap-merged. Only the first match is
 windowed.
 
-``format_row`` renders the one model-visible row shape every tool shares —
+``build_row`` / ``format_row`` are the one row shape every tool shares —
 outline/node_filter (map rows: indented, ``summary``, ``chunk_count``),
 grep/recall (hit rows: flat, ``snippet``, ``score``), and assets (asset rows:
-``chunk_id`` plus the hosting ``section_path``) all call this instead of
-building their own line format, so a model reads one row shape regardless of
-which tool produced it and copies the same fields (``document_id`` +
-``section_path``/``chunk_id``) into ``corpus.read``.
+``chunk_id`` plus the hosting ``section_path``) all build the same record for
+``payload["rows"]`` and render it the same way, so a model reads one row
+shape regardless of which tool produced it and copies the same fields
+(``document_id`` + ``section_path``/``chunk_id``) into ``corpus.read``.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
 
 HIT_CONTEXT_CHARS = 80
 HEAD_TAIL_CHARS = 50
@@ -72,7 +75,7 @@ def build_snippet(
     return "".join(parts)
 
 
-def format_row(
+def build_row(
     *,
     kind: str,
     document_id: object,
@@ -82,38 +85,59 @@ def format_row(
     chunk_count: int | None = None,
     summary: str = "",
     snippet: str = "",
-    score: object | None = None,
+    score: float | None = None,
     depth: int = 0,
     is_hit: bool = False,
-) -> str:
-    """Render one row. Every ``corpus.*`` search/map tool shares this shape.
+    hosted: bool | None = None,
+) -> dict[str, Any]:
+    """One row record. Every ``corpus.*`` search/map tool returns these in
+    ``payload["rows"]`` and renders them with ``format_row``.
 
     ``kind`` is ``section`` (outline/node_filter node), ``text``/``page``
     (body hit), or ``image``/``table`` (asset — its own body chunk or a hit
-    on one). ``chunk_id`` is included for ``image``/``table`` rows (their
-    stored ``section_path`` is the document Root — this field then names the
-    *hosting* section instead, or stays ``Root`` when no host was found).
+    on one). For ``image``/``table`` rows ``section_path`` is the *hosting*
+    section, and ``hosted`` says whether a host was found (``False`` keeps
+    the asset's own ``Root`` path); it is ``None`` for every other kind.
     ``chunk_count``/``summary`` are map-row fields; ``snippet``/``score`` are
     hit-row fields; ``depth`` indents a map row under its parent; ``is_hit``
     marks a row lit up by node_filter/lighting scoring.
     """
-    indent = "  " * max(depth, 0)
-    label = str(title or "").strip()
-    header = f"{indent}- [{kind}]"
-    if label:
-        header += f" {label}"
-    header += f" | document_id={document_id} section_path={section_path}"
-    if chunk_id:
-        header += f" chunk_id={chunk_id}"
-    if chunk_count is not None:
-        header += f" (chunks={chunk_count})"
-    if score is not None:
-        header += f" score={score}"
-    if is_hit:
+    return {
+        "kind": kind,
+        "title": str(title or "").strip(),
+        "document_id": str(document_id),
+        "section_path": str(section_path),
+        "chunk_id": str(chunk_id) if chunk_id else None,
+        "chunk_count": chunk_count,
+        "summary": summary,
+        "snippet": snippet,
+        "score": score,
+        "is_hit": is_hit,
+        "depth": max(depth, 0),
+        "hosted": hosted,
+    }
+
+
+def format_row(row: Mapping[str, Any]) -> str:
+    """Render one ``build_row`` record as the shared model-visible row."""
+    indent = "  " * row["depth"]
+    header = f"{indent}- [{row['kind']}]"
+    if row["title"]:
+        header += f" {row['title']}"
+    header += f" | document_id={row['document_id']} section_path={row['section_path']}"
+    if row["hosted"] is False:
+        header += " (no host section)"
+    if row["chunk_id"]:
+        header += f" chunk_id={row['chunk_id']}"
+    if row["chunk_count"] is not None:
+        header += f" (chunks={row['chunk_count']})"
+    if row["score"] is not None:
+        header += f" score={row['score']}"
+    if row["is_hit"]:
         header += " [Hit]"
     lines = [header]
-    if summary:
-        lines.append(f"{indent}  summary: {summary}")
-    if snippet:
-        lines.append(f"{indent}  snippet: {snippet!r}")
+    if row["summary"]:
+        lines.append(f"{indent}  summary: {row['summary']}")
+    if row["snippet"]:
+        lines.append(f"{indent}  snippet: {row['snippet']!r}")
     return "\n".join(lines)

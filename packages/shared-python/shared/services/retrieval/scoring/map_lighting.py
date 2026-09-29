@@ -17,7 +17,7 @@ unscored fold.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from hashlib import sha256
 
 from sqlalchemy import select, tuple_
@@ -49,7 +49,7 @@ async def load_leaf_unit_scores(
     revision_by_document: dict[str, str],
     section_ids: list[str],
     query: str,
-) -> dict[str, float]:
+) -> dict[str, float] | None:
     """BM25 path+content score, pooled onto ``section_id``, for one ``query``.
 
     Scoped to exactly the ``section_ids`` the caller already rendered (an
@@ -61,13 +61,16 @@ async def load_leaf_unit_scores(
     discovery module's hand-rolled ``text()`` CTEs, since lighting's scope is
     already a concrete id list, not a filter to compile.
 
-    A section with no map unit at all (never indexed, or the index is stale)
-    is simply absent from the returned mapping — callers treat a missing key
-    as score ``0.0``, the same as a unit that scored zero.
+    Returns ``None`` when the map cannot be scored at all: the query has no
+    rankable token, no rendered section has a map unit on its current
+    revision, or some revision lacks a compatible map-unit index. Folding
+    on all-zero scores would hide arbitrary branches, so callers fail the
+    call instead. A section that simply has no unit of its own is absent
+    from the mapping and scores ``0.0``.
     """
     query_tokens = tokenize_query_for_ranker(query)
     if not query_tokens or not section_ids or not revision_by_document:
-        return {}
+        return None
     token_hashes = [sha256(token.encode("utf-8")).hexdigest() for token in query_tokens]
 
     unit_rows = (
@@ -87,7 +90,7 @@ async def load_leaf_unit_scores(
         if revision_by_document.get(row.document_id) == row.job_result_id
     ]
     if not unit_rows:
-        return {}
+        return None
 
     map_unit_ids = [row.id for row in unit_rows]
     token_rows = await db.execute(
@@ -108,7 +111,7 @@ async def load_leaf_unit_scores(
             frequency
         )
 
-    revision_pairs = sorted({(row.document_id, row.job_result_id) for row in unit_rows})
+    revision_pairs = sorted(revision_by_document.items())
     index_rows = (
         (
             await db.execute(
@@ -126,8 +129,8 @@ async def load_leaf_unit_scores(
     compatible_indexes = [
         row for row in index_rows if row.format_version == MAP_UNIT_INDEX_FORMAT_VERSION
     ]
-    if not compatible_indexes:
-        return {}
+    if len(compatible_indexes) != len(revision_pairs):
+        return None
     average_idf_path = combine_average_idf(
         [(row.average_idf_path, row.unit_count) for row in compatible_indexes]
     )
@@ -220,89 +223,166 @@ def pool_scores_to_tree(
     return pooled
 
 
-@dataclass
+MAP_LIGHT_HIT_COUNT = 5
+
+
+def top_hit_ids(leaf_scores: dict[str, float], *, limit: int = MAP_LIGHT_HIT_COUNT) -> list[str]:
+    """The highest positive own-scores — the rows lighting marks ``[Hit]``
+    and never folds away."""
+    ranked = sorted(
+        ((score, section_id) for section_id, score in leaf_scores.items() if score > 0),
+        key=lambda item: (-item[0], item[1]),
+    )
+    return [section_id for _, section_id in ranked[:limit]]
+
+
+_TOP_LEVEL_KEY = "<root>"
+
+
+@dataclass(frozen=True)
 class MapNode:
-    """One row of a rendered outline/node_filter map."""
+    """One row of a rendered outline/node_filter map.
+
+    ``parent_section_id`` is the parent only when that parent is itself a
+    row of the same map; ``depth`` is the row's indent level.
+    """
 
     section_id: str
     parent_section_id: str | None
     render: str
+    depth: int = 0
     score: float = 0.0
-    hidden: bool = False
-    render_chars: int = field(init=False)
 
-    def __post_init__(self) -> None:
-        self.render_chars = len(self.render) + 1
+
+@dataclass(frozen=True)
+class FoldResult:
+    lines: list[str]
+    visible_ids: set[str]
+    hidden_count: int
+    overflow: bool
+
+
+def hidden_placeholder_line(count: int, *, depth: int | None) -> str:
+    """The row left in place of a folded subtree (``depth=None``: top level)."""
+    if depth is None:
+        return f"(hidden {count} nodes at the top level — re-scope to expand)"
+    return "  " * (depth + 1) + (
+        f"(hidden {count} nodes under this section — "
+        "re-scope to its section_path to expand)"
+    )
+
+
+def render_map_lines(
+    nodes: list[MapNode],
+    *,
+    hidden_ids: set[str] | frozenset[str] = frozenset(),
+    hidden_counts: dict[str, int] | None = None,
+) -> list[str]:
+    counts = hidden_counts or {}
+    lines: list[str] = []
+    for node in nodes:
+        if node.section_id in hidden_ids:
+            continue
+        lines.append(node.render)
+        count = counts.get(node.section_id)
+        if count:
+            lines.append(hidden_placeholder_line(count, depth=node.depth))
+    top_level = counts.get(_TOP_LEVEL_KEY)
+    if top_level:
+        lines.append(hidden_placeholder_line(top_level, depth=None))
+    return lines
+
+
+def _joined_chars(lines: list[str]) -> int:
+    return sum(len(line) for line in lines) + max(len(lines) - 1, 0)
 
 
 def fold_map_nodes(
     nodes: list[MapNode],
     *,
     char_budget: int,
-) -> tuple[list[MapNode], dict[str, int]]:
-    """Hide lowest-score subtrees until the total rendering fits ``char_budget``.
+    protected_ids: set[str] | frozenset[str] = frozenset(),
+) -> FoldResult:
+    """Hide lowest-score subtrees until the joined map lines fit ``char_budget``.
 
-    Never hides a node in isolation — only whole subtrees rooted at a node
-    with no other visible ancestor already hidden — and never truncates a
-    single row's text. Nodes are chosen lowest-score-first (largest subtree
-    first among ties), so a positive-scoring branch is only touched once
-    every zero/low-scoring branch has already been hidden and the budget
-    still is not met — this is how "the highest-scoring nodes and their
-    ancestor chain stay visible" holds without a separate hardcoded
-    protected-count.
-
-    Returns the still-visible nodes (original order) and, per section_id
-    whose children were folded, how many descendant nodes were hidden under
-    it (``"<root>"`` for a hidden top-level scope target) — the caller
-    renders that count as one placeholder line under that node.
+    Every id in ``protected_ids`` and all of its ancestors are never hidden;
+    a subtree is a removal candidate only when no protected row lies in it.
+    Candidates go lowest score first, largest subtree first among ties.
+    The budget counts the placeholder rows left behind, not just the
+    visible rows. ``overflow`` is set when the rows that must stay (plus
+    their placeholders) still exceed ``char_budget``; the caller fails the
+    call rather than hiding a protected row or cutting text.
     """
-    total_chars = sum(node.render_chars for node in nodes)
-    if total_chars <= char_budget or not nodes:
-        return nodes, {}
-
     by_id = {node.section_id: node for node in nodes}
     children_by_parent: dict[str, list[str]] = {}
     for node in nodes:
-        if node.parent_section_id:
-            children_by_parent.setdefault(node.parent_section_id, []).append(
+        if node.parent_section_id in by_id:
+            children_by_parent.setdefault(str(node.parent_section_id), []).append(
                 node.section_id
             )
 
+    keep: set[str] = set()
+    for protected_id in protected_ids:
+        current = by_id.get(protected_id)
+        while current is not None and current.section_id not in keep:
+            keep.add(current.section_id)
+            current = by_id.get(current.parent_section_id or "")
+
+    subtree_cache: dict[str, list[str]] = {}
+
     def subtree_ids(section_id: str) -> list[str]:
+        cached = subtree_cache.get(section_id)
+        if cached is not None:
+            return cached
         ids = [section_id]
         for child_id in children_by_parent.get(section_id, []):
             ids.extend(subtree_ids(child_id))
+        subtree_cache[section_id] = ids
         return ids
 
-    def subtree_chars(section_id: str) -> int:
-        return sum(
-            by_id[sid].render_chars
-            for sid in subtree_ids(section_id)
-            if sid in by_id and not by_id[sid].hidden
-        )
-
+    row_chars = {node.section_id: len(node.render) + 1 for node in nodes}
+    visible_chars = sum(row_chars.values())
+    hidden_ids: set[str] = set()
     hidden_counts: dict[str, int] = {}
-    remaining = total_chars
+
+    def placeholder_chars() -> int:
+        total = 0
+        for key, count in hidden_counts.items():
+            depth = None if key == _TOP_LEVEL_KEY else by_id[key].depth
+            total += len(hidden_placeholder_line(count, depth=depth)) + 1
+        return total
+
     candidates = sorted(
-        nodes, key=lambda node: (node.score, -subtree_chars(node.section_id), node.section_id)
+        (node for node in nodes if node.section_id not in keep),
+        key=lambda node: (
+            node.score,
+            -sum(row_chars[sid] for sid in subtree_ids(node.section_id)),
+            node.section_id,
+        ),
     )
     for candidate in candidates:
-        if remaining <= char_budget:
+        if visible_chars + placeholder_chars() - 1 <= char_budget:
             break
-        if candidate.hidden:
+        if candidate.section_id in hidden_ids:
             continue
-        ids = [sid for sid in subtree_ids(candidate.section_id) if sid in by_id]
-        removable = [sid for sid in ids if not by_id[sid].hidden]
-        if not removable:
-            continue
-        removed_chars = sum(by_id[sid].render_chars for sid in removable)
-        for sid in removable:
-            by_id[sid].hidden = True
-        remaining -= removed_chars
-        placeholder_key = candidate.parent_section_id or "<root>"
-        hidden_counts[placeholder_key] = hidden_counts.get(placeholder_key, 0) + len(
-            removable
+        ids = subtree_ids(candidate.section_id)
+        newly_hidden = [sid for sid in ids if sid not in hidden_ids]
+        folded = len(newly_hidden) + sum(
+            hidden_counts.pop(sid) for sid in ids if sid in hidden_counts
         )
+        hidden_ids.update(newly_hidden)
+        visible_chars -= sum(row_chars[sid] for sid in newly_hidden)
+        key = (
+            str(candidate.parent_section_id)
+            if candidate.parent_section_id in by_id
+            else _TOP_LEVEL_KEY
+        )
+        hidden_counts[key] = hidden_counts.get(key, 0) + folded
 
-    visible = [node for node in nodes if not node.hidden]
-    return visible, hidden_counts
+    lines = render_map_lines(nodes, hidden_ids=hidden_ids, hidden_counts=hidden_counts)
+    return FoldResult(
+        lines=lines,
+        visible_ids={node.section_id for node in nodes if node.section_id not in hidden_ids},
+        hidden_count=sum(hidden_counts.values()),
+        overflow=_joined_chars(lines) > char_budget,
+    )

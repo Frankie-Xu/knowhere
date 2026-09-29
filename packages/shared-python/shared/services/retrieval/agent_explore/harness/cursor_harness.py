@@ -84,9 +84,10 @@ from shared.services.retrieval.agent_explore.dispatch import DbFactory, dispatch
 from shared.services.retrieval.agent_explore.shared import (
     EVIDENCE_TOOL_NAMES,
     budget_status_line,
-    char_budget_for_tool,
     cursor_execute_content,
     finish_refs_from_args,
+    invalid_finish_message,
+    read_ref_status,
     select_episode_refs,
     tool_message_content,
     validate_finish_args,
@@ -212,7 +213,8 @@ class CursorHarness:
             elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
             content = tool_message_content(
                 tool_result,
-                max_chars=char_budget_for_tool(tool_name, tool_budget.max_chars),
+                tool_name=tool_name,
+                max_chars=tool_budget.max_chars,
             )
             # Appended per call, unlike openai_harness.py's once-per-turn
             # placement — this harness has no batched-turn concept exposed to
@@ -232,6 +234,7 @@ class CursorHarness:
                     elapsed_ms=elapsed_ms,
                     tokens_used_delta=0,
                     tokens_used_total=budget.tokens_used,
+                    ref_status=read_ref_status(tool_name, tool_result),
                 )
             )
             if tool_name in EVIDENCE_TOOL_NAMES and not tool_result.error:
@@ -273,7 +276,9 @@ class CursorHarness:
                             tokens_used_total=budget.tokens_used,
                         )
                     )
-                return json.dumps({"status": "error", "error": validation_error})
+                return json.dumps(
+                    {"status": "error", "error": invalid_finish_message(validation_error)}
+                )
             selected = finish_refs_from_args(args)
             cited = selected if selected is not None else []
             notes = str(args.get("notes") or "")

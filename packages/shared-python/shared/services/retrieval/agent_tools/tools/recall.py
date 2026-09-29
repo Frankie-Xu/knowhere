@@ -4,14 +4,9 @@ One live scoring path: ``search.map_unit_discovery.map_unit_discovery``
 (persisted map-unit BM25 over path + content, already RRF-fused there).
 Exact-string lookup is ``corpus.grep``, not a second channel here.
 
-A ``scope`` section-subtree restriction is applied *after* that call, over
-a pool of up to ``budget.max_items`` candidates, not as a SQL predicate
-inside ``map_unit_discovery`` itself — that shared function backs classic
-retrieval as well, and adding a new SQL clause there was judged a
-materially bigger, riskier change than this tool warrants. In the rare
-case where a scoped subtree's true best matches fall outside that pool,
-this under-returns rather than searching outside the scope — disclosed
-here, not silent.
+``scope`` is applied in that same discovery SQL: a named section is that
+section and everything under it, scored before ranking. Classic retrieval
+does not pass section targets, so its SQL is unchanged.
 
 Rows render through the shared ``agent_tools.snippet.format_row`` — the
 same row shape ``corpus.outline``/``corpus.node_filter``/``corpus.grep``/
@@ -43,21 +38,6 @@ from shared.services.retrieval.search.map_unit_discovery import map_unit_discove
 _DEFAULT_LIMIT = 10
 
 
-def _in_scope(scope: list[ScopeTarget], *, document_id: str, section_path: str) -> bool:
-    if not scope:
-        return True
-    for target in scope:
-        if target.document_id != document_id:
-            continue
-        if target.section_path is None:
-            return True
-        if section_path == target.section_path or section_path.startswith(
-            f"{target.section_path} / "
-        ):
-            return True
-    return False
-
-
 def _identifier_snippet(row: dict[str, Any]) -> str:
     """Body/image fall back to content; tables never use the stored path."""
     snippet = str(row.get("snippet") or "").strip()
@@ -87,10 +67,21 @@ def _identifier_snippet(row: dict[str, Any]) -> str:
     json_schema={
         "type": "object",
         "properties": {
-            "query": {"type": "string"},
+            "query": {
+                "type": "string",
+                "description": "The fuzzy question to rank path and content against.",
+            },
             "scope": SCOPE_SCHEMA,
-            "chunk_types": {"type": "array", "items": {"type": "string"}},
-            "limit": {"type": "integer", "default": _DEFAULT_LIMIT},
+            "chunk_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Restrict hits to these chunk types (text, page, image, table).",
+            },
+            "limit": {
+                "type": "integer",
+                "default": _DEFAULT_LIMIT,
+                "description": "Max ranked candidates to return.",
+            },
         },
         "required": ["query"],
         "additionalProperties": False,
@@ -121,33 +112,22 @@ async def recall(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     document_scope = (
         ctx.document_scope.narrow(scope_document_ids(scope)) if scope else ctx.document_scope
     )
-    scoped_subtree = any(target.section_path is not None for target in scope)
-
-    # See module docstring: subtree scoping is a post-filter over a
-    # bounded pool here, not a SQL predicate inside map_unit_discovery.
-    discovery_top_k = ctx.budget.max_items if scoped_subtree else limit
     discovery = await map_unit_discovery(
         ctx.db,
         user_id=ctx.user_id,
         namespace=ctx.namespace,
         query=query,
-        top_k=discovery_top_k,
+        top_k=limit,
         exclude_document_ids=[],
         document_scope=document_scope,
         exclude_sections=[],
         chunk_types=chunk_types,
+        section_targets=[
+            (target.document_id, target.section_path) for target in scope
+        ]
+        or None,
     )
     rows = list(discovery.payload.get("fused_rows") or [])
-    if scoped_subtree:
-        rows = [
-            row
-            for row in rows
-            if _in_scope(
-                scope,
-                document_id=str(row.get("document_id") or ""),
-                section_path=str(row.get("section_path") or ""),
-            )
-        ][:limit]
 
     media: list[dict[str, str]] = []
     if rows:

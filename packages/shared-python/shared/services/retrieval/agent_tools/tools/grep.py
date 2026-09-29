@@ -111,9 +111,21 @@ def _term_search(terms: list[str]) -> tuple[re.Pattern[str], Any]:
                 "description": "Several search terms OR'd together in this one call.",
             },
             "scope": SCOPE_SCHEMA,
-            "chunk_types": {"type": "array", "items": {"type": "string"}},
-            "context_chars": {"type": "integer", "default": _DEFAULT_CONTEXT_CHARS},
-            "limit": {"type": "integer", "default": _DEFAULT_LIMIT},
+            "chunk_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Restrict hits to these chunk types (text, page, image, table).",
+            },
+            "context_chars": {
+                "type": "integer",
+                "default": _DEFAULT_CONTEXT_CHARS,
+                "description": "Characters of context around the first match in the snippet.",
+            },
+            "limit": {
+                "type": "integer",
+                "default": _DEFAULT_LIMIT,
+                "description": "Max rows to return. The total match count is still reported.",
+            },
         },
         "anyOf": [
             {"required": ["pattern"]},

@@ -67,10 +67,11 @@ from shared.services.retrieval.agent_explore.shared import (
     EVIDENCE_TOOL_NAMES,
     budget_status_line,
     build_wire_tool_name_map,
-    char_budget_for_tool,
     finish_refs_from_args,
     https_image_parts,
+    invalid_finish_message,
     model_accepts_images,
+    read_ref_status,
     select_episode_refs,
     tool_message_content,
     validate_finish_args,
@@ -139,14 +140,12 @@ def _build_openai_tools() -> tuple[list[dict[str, Any]], dict[str, str]]:
 def _parse_tool_arguments(raw: str | None) -> tuple[dict[str, Any], str | None]:
     """Parse one tool call's JSON arguments, or return the parse error.
 
-    Malformed JSON used to become ``{}`` silently — every caller below now
-    surfaces the parse failure instead: a corpus.* tool call fails that one
-    call via the existing per-call ``ToolResult.error`` path (unchanged
-    otherwise — the episode is not aborted), and a malformed ``finish`` call
-    ends the episode with the parse error recorded instead of silently
-    finishing with no refs.
+    Only a missing argument string or an explicit ``{}`` is an empty object;
+    an empty string or malformed JSON is an error. Either way the error
+    fails just that one call (a corpus.* tool or ``finish``) and is sent
+    back to the model — the episode continues.
     """
-    if not raw:
+    if raw is None:
         return {}, None
     try:
         parsed = json.loads(raw)
@@ -270,10 +269,14 @@ class OpenAIHarness:
             finish_call = next(
                 (tc for tc in tool_calls if tc.function.name == FINISH_TOOL_NAME), None
             )
+            finish_error: str | None = None
             if finish_call is not None:
                 args, parse_error = _parse_tool_arguments(finish_call.function.arguments)
                 if parse_error is None:
                     parse_error = validate_finish_args(args)
+                if parse_error is not None and forced_reason is None:
+                    finish_error = parse_error
+            if finish_call is not None and finish_error is None:
                 finish_refs = finish_refs_from_args(args) if parse_error is None else None
                 cited = finish_refs if finish_refs is not None else []
                 result_notes = (
@@ -339,7 +342,11 @@ class OpenAIHarness:
                 args, parse_error = _parse_tool_arguments(tc.function.arguments)
                 requested_name = str(tc.function.name or "")
                 canonical_name = tool_name_map.get(requested_name, requested_name)
-                if parse_error is not None:
+                if tc is finish_call:
+                    tool_result = ToolResult(
+                        text="", error=invalid_finish_message(str(finish_error))
+                    )
+                elif parse_error is not None:
                     tool_result = ToolResult(text="", error=parse_error)
                 else:
                     tool_result = await dispatch_tool_call(
@@ -355,7 +362,8 @@ class OpenAIHarness:
                 tool_elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
                 content = tool_message_content(
                     tool_result,
-                    max_chars=char_budget_for_tool(canonical_name, tool_budget.max_chars),
+                    tool_name=canonical_name,
+                    max_chars=tool_budget.max_chars,
                 )
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
@@ -395,6 +403,7 @@ class OpenAIHarness:
                         ),
                         tokens_used_delta=0 if first_tool_tokens_recorded else turn_tokens,
                         tokens_used_total=budget.tokens_used,
+                        ref_status=read_ref_status(canonical_name, tool_result),
                     )
                 )
                 first_tool_tokens_recorded = True

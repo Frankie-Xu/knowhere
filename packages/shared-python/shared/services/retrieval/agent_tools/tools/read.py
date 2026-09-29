@@ -39,6 +39,8 @@ from shared.models.database.document import (
 )
 from shared.models.database.job_result import JobResult
 from shared.services.retrieval.agent_tools.registry import (
+    REF_ADDRESS_ONE_OF,
+    REF_ADDRESS_RULE,
     ToolContext,
     ToolResult,
     register_tool,
@@ -63,6 +65,20 @@ from shared.services.retrieval.search.lexical_text import section_path_from_chun
 
 _SAME_AS_MARKER_RE = re.compile(r"\[SAME-AS (.+?) p(\d+)\]")
 _BODY_CHUNK_TYPES = ("text", "page")
+# Repeated after the ref list and after the body: a long body can be cut by
+# the per-turn text cap, and the ref list alone may scroll out of view.
+_PICK_REMINDER = (
+    "[pick: decide now, for each [ok] ref, whether to cite it in finish; "
+    "[failed] refs cannot be cited]"
+)
+
+
+def _ref_status_line(entry: dict[str, Any]) -> str:
+    tag = "[ok]" if entry["status"] == "ok" else f"[failed: {entry['reason']}]"
+    return (
+        f"{tag} document_id={entry['document_id']} "
+        f"section_path={entry['section_path']} chunk_id={entry['chunk_id']}"
+    )
 
 
 def _section_belongs_to_resolved_path(
@@ -255,15 +271,26 @@ def _collect_https_image_media(
                 "items": {
                     "type": "object",
                     "properties": {
-                        "document_id": {"type": "string"},
-                        "section_path": {"type": "string"},
-                        "chunk_id": {"type": "string"},
+                        "document_id": {
+                            "type": "string",
+                            "description": "Document that owns this section or chunk.",
+                        },
+                        "section_path": {
+                            "type": "string",
+                            "description": "Section to read. Omit when chunk_id is set.",
+                        },
+                        "chunk_id": {
+                            "type": "string",
+                            "description": "Chunk to read. Omit when section_path is set.",
+                        },
                     },
                     "required": ["document_id"],
+                    "oneOf": REF_ADDRESS_ONE_OF,
                     "additionalProperties": False,
+                    "description": REF_ADDRESS_RULE,
                 },
                 "minItems": 1,
-                "description": "Each ref needs document_id and either section_path or chunk_id.",
+                "description": "Each ref needs document_id and exactly one of section_path or chunk_id.",
             },
             "mode": {
                 "type": "string",
@@ -274,8 +301,16 @@ def _collect_https_image_media(
                     "section_path ref; ignored for chunk_id refs."
                 ),
             },
-            "include_assets": {"type": "boolean", "default": True},
-            "resolve_same_as": {"type": "boolean", "default": True},
+            "include_assets": {
+                "type": "boolean",
+                "default": True,
+                "description": "Inline connect_to images and tables into the body.",
+            },
+            "resolve_same_as": {
+                "type": "boolean",
+                "default": True,
+                "description": "Replace page-track SAME-AS markers with the owner text.",
+            },
         },
         "required": ["refs"],
         "additionalProperties": False,
@@ -535,17 +570,18 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 f"{job['document_id']} (image/table-only or empty section)"
             )
 
+    status_lines = [_ref_status_line(entry) for entry in ref_status]
     if not base_rows:
         return ToolResult(
-            text="\n".join(
-                f"[{entry['status']}"
-                + (f": {entry['reason']}" if entry["reason"] else "")
-                + f"] document_id={entry['document_id']} "
-                f"section_path={entry['section_path']} chunk_id={entry['chunk_id']}"
-                for entry in ref_status
-            ),
+            text="\n".join(status_lines),
             payload={"chunks": [], "refs": ref_status},
-            error="no chunks resolved for given refs",
+            error=(
+                "read: every ref failed, nothing was read:\n"
+                + "\n".join(status_lines)
+                + "\nNone of these can be picked for finish. Fix each ref "
+                "(copy document_id + section_path/chunk_id exactly from an "
+                "outline/node_filter/grep/recall/assets row) and retry."
+            ),
         )
 
     if resolve_same_as_flag:
@@ -601,19 +637,14 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             composed["content"] = _image_display_content(row)
         assembled.append(composed)
 
-    lines = ["refs:"]
-    for entry in ref_status:
-        tag = "[ok]" if entry["status"] == "ok" else f"[failed: {entry['reason']}]"
-        lines.append(
-            f"  {tag} document_id={entry['document_id']} "
-            f"section_path={entry['section_path']} chunk_id={entry['chunk_id']}"
-        )
+    lines = ["refs:", *(f"  {line}" for line in status_lines), _PICK_REMINDER]
     for row in assembled:
         lines.append(
             f"### {row.get('source_file_name')} ({row.get('document_id')}) / "
             f"{row.get('section_path')} [{row.get('chunk_type')}]"
         )
         lines.append(str(row.get("content") or ""))
+    lines.append(_PICK_REMINDER)
 
     return ToolResult(
         text="\n".join(lines),

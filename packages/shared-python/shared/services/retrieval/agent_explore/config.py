@@ -8,6 +8,8 @@ codebase's OpenAI-compatible client.
 
 from __future__ import annotations
 
+from shared.services.retrieval.agent_tools.registry import REF_ADDRESS_ONE_OF, REF_ADDRESS_RULE
+
 AGENT_EXPLORE_MODEL = "deepseek-v4-flash"
 
 # Model for AGENT_EXPLORE_HARNESS=cursor_sdk (harness/cursor_harness.py) —
@@ -46,12 +48,23 @@ FINISH_TOOL_SCHEMA: dict[str, object] = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "document_id": {"type": "string"},
-                    "section_path": {"type": "string"},
-                    "chunk_id": {"type": "string"},
+                    "document_id": {
+                        "type": "string",
+                        "description": "Document that owns the cited section or chunk.",
+                    },
+                    "section_path": {
+                        "type": "string",
+                        "description": "Cited section. Omit when chunk_id is set.",
+                    },
+                    "chunk_id": {
+                        "type": "string",
+                        "description": "Cited chunk. Omit when section_path is set.",
+                    },
                 },
                 "required": ["document_id"],
+                "oneOf": REF_ADDRESS_ONE_OF,
                 "additionalProperties": False,
+                "description": REF_ADDRESS_RULE,
             },
         },
         "notes": {

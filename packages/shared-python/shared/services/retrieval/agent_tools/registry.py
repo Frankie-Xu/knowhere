@@ -13,6 +13,7 @@ provider-specific (MCP / OpenAI tool-calling) concerns.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
@@ -27,11 +28,35 @@ from shared.services.retrieval.settings import EVIDENCE_TEXT_CHAR_BUDGET
 
 DbFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
+logger = logging.getLogger(__name__)
+
 # Char budget for the two map tools (``corpus.outline``, ``corpus.node_filter``)
 # once they self-bound via lighting instead of a hard mid-text cut — see
 # ``scoring/map_lighting.py`` and each harness's ``tool_message_content`` call.
 # Every other tool still uses ``EVIDENCE_TEXT_CHAR_BUDGET`` below.
 MAP_TOOL_CHAR_BUDGET = 20_000
+
+CHUNK_TYPE_VALUES = ("text", "page", "image", "table")
+
+
+# ``oneOf`` for a ``{document_id, section_path | chunk_id}`` ref item: exactly
+# one address. The item schema's ``description`` is the validation message.
+REF_ADDRESS_ONE_OF: list[dict[str, Any]] = [
+    {"required": ["section_path"], "not": {"required": ["chunk_id"]}},
+    {"required": ["chunk_id"], "not": {"required": ["section_path"]}},
+]
+REF_ADDRESS_RULE = "each ref needs document_id plus exactly one of section_path or chunk_id"
+
+
+def chunk_types_schema(description: str) -> dict[str, Any]:
+    """``chunk_types`` argument schema shared by every tool that filters on it."""
+    return {
+        "type": "array",
+        "items": {"type": "string", "enum": list(CHUNK_TYPE_VALUES)},
+        "minItems": 1,
+        "uniqueItems": True,
+        "description": description,
+    }
 
 
 @dataclass(frozen=True)
@@ -61,8 +86,12 @@ class ToolBudget:
 
 
 def capped_limit(requested: int, budget: ToolBudget) -> int:
-    """Clamp a caller-requested row count to ``budget.max_items`` (min 1)."""
-    return max(1, min(requested, budget.max_items))
+    """Clamp a caller-requested row count down to ``budget.max_items``.
+
+    The lower bound is the tool schema's ``minimum`` — a non-positive
+    request fails validation instead of being raised to 1 here.
+    """
+    return min(requested, budget.max_items)
 
 
 @dataclass
@@ -143,7 +172,18 @@ class ToolRegistry:
         schema_error = validate_tool_args(spec, args)
         if schema_error is not None:
             return ToolResult(text="", error=schema_error)
-        return await spec.run(ctx, args)
+        try:
+            return await spec.run(ctx, args)
+        except Exception as exc:  # noqa: BLE001 - one broken call must not end the caller's loop
+            logger.exception("corpus tool %s raised", name)
+            return ToolResult(
+                text="",
+                error=(
+                    f"{name}: internal error ({type(exc).__name__}: {exc}). Only "
+                    "this call failed — retry with a narrower scope, or use "
+                    "another corpus.* tool."
+                ),
+            )
 
 
 def _describe_error_path(path: Any) -> str:
@@ -195,6 +235,12 @@ def validate_tool_args(spec: ToolSpec, args: dict[str, Any]) -> str | None:
     if error.validator == "required":
         return (
             f"{spec.name}: {error.message} at {path}. "
+            f"Top-level arguments: {top_level_args}."
+        )
+    if error.validator == "oneOf":
+        rule = error.schema.get("description") if isinstance(error.schema, dict) else None
+        return (
+            f"{spec.name}: invalid argument at {path}: {rule or error.message}. "
             f"Top-level arguments: {top_level_args}."
         )
     return (
