@@ -209,11 +209,25 @@ async def execute_retrieval_query(
     else:
         resolved_chunk_types = None
 
+    query = str(payload.query or "").strip()
+    if not query:
+        return {
+            "namespace": normalize_retrieval_namespace(payload.namespace),
+            "query": query,
+            "router_used": "empty_query_filtered",
+            "failure_reason": "empty query — retrieval was not run",
+            "evidence": [],
+            "evidence_text": "",
+            "answer_text": "",
+            "referenced_chunks": [],
+            "results": [],
+        }
+
     return await run_retrieval_query(
         db=db,
         user_id=current_user.user_id,
         namespace=normalize_retrieval_namespace(payload.namespace),
-        query=payload.query,
+        query=query,
         top_k=payload.top_k,
         include_document_ids=payload.include_document_ids,
         exclude_document_ids=payload.exclude_document_ids,

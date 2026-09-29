@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared.services.retrieval.agent_tools.asset_hosts import host_paths_for_hits
 from shared.services.retrieval.agent_tools.explore_mount import mount_explore_hits
 from shared.services.retrieval.agent_tools.registry import (
     ToolContext,
     ToolResult,
     capped_limit,
+    chunk_types_schema,
     register_tool,
 )
 from shared.services.retrieval.agent_tools.scope import (
@@ -30,7 +32,7 @@ from shared.services.retrieval.agent_tools.scope import (
     resolve_scope,
     scope_document_ids,
 )
-from shared.services.retrieval.agent_tools.snippet import build_snippet, format_row
+from shared.services.retrieval.agent_tools.snippet import build_row, build_snippet, format_row
 from shared.services.retrieval.hydration.row_utils import normalize_chunk_type
 from shared.services.retrieval.settings import ASSET_CHUNK_TYPES
 from shared.services.retrieval.search.map_unit_discovery import map_unit_discovery
@@ -72,13 +74,12 @@ def _identifier_snippet(row: dict[str, Any]) -> str:
                 "description": "The fuzzy question to rank path and content against.",
             },
             "scope": SCOPE_SCHEMA,
-            "chunk_types": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Restrict hits to these chunk types (text, page, image, table).",
-            },
+            "chunk_types": chunk_types_schema(
+                "Restrict hits to these chunk types. Old type names are rejected."
+            ),
             "limit": {
                 "type": "integer",
+                "minimum": 1,
                 "default": _DEFAULT_LIMIT,
                 "description": "Max ranked candidates to return.",
             },
@@ -134,7 +135,9 @@ async def recall(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         rows, media = await mount_explore_hits(
             ctx, rows, char_budget=ctx.budget.max_chars
         )
+    host_paths = await host_paths_for_hits(ctx, rows, scope)
 
+    payload_rows: list[dict[str, Any]] = []
     lines = [f"candidates={len(rows)}"]
     if len(rows) < 2:
         # No tool name named here on purpose — this fires on *every* weak
@@ -150,32 +153,42 @@ async def recall(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         )
     if requested_limit > limit:
         lines.append(f"note: capped to budget.max_items={ctx.budget.max_items}")
-    for row in rows:
-        snippet = _identifier_snippet(row)
-        chunk_type = str(row.get("chunk_type") or "").strip()
-        lines.append(
-            format_row(
-                kind=chunk_type or "text",
-                document_id=row.get("document_id"),
-                section_path=row.get("section_path"),
-                title=row.get("source_file_name"),
-                chunk_id=(
-                    row.get("chunk_id") if chunk_type in ASSET_CHUNK_TYPES else None
-                ),
-                snippet=snippet,
-                score=row.get("score"),
-            )
+    for hit in rows:
+        snippet = _identifier_snippet(hit)
+        chunk_type = str(hit.get("chunk_type") or "").strip()
+        is_asset = chunk_type in ASSET_CHUNK_TYPES
+        key = (str(hit.get("document_id") or ""), str(hit.get("chunk_id") or ""))
+        section_path, hosted = (
+            host_paths[key]
+            if is_asset and key in host_paths
+            else (hit.get("section_path"), None)
         )
-        rendered = str(row.get("rendered") or "").strip()
+        raw_score = hit.get("score")
+        row = build_row(
+            kind=chunk_type or "text",
+            document_id=hit.get("document_id"),
+            section_path=section_path,
+            title=hit.get("source_file_name"),
+            chunk_id=hit.get("chunk_id") if is_asset else None,
+            snippet=snippet,
+            score=float(raw_score) if raw_score is not None else None,
+            hosted=hosted if is_asset else None,
+        )
+        payload_rows.append(row)
+        lines.append(format_row(row))
+        rendered = str(hit.get("rendered") or "").strip()
         if rendered:
             lines.append(rendered)
 
     return ToolResult(
         text="\n".join(lines),
-        payload={"candidates": rows},
+        payload={
+            "rows": payload_rows,
+            "details": {"capped": requested_limit > limit},
+        },
         refs=[
-            {"document_id": row.get("document_id"), "chunk_id": row.get("chunk_id")}
-            for row in rows
+            {"document_id": hit.get("document_id"), "chunk_id": hit.get("chunk_id")}
+            for hit in rows
         ],
         media=media,
     )

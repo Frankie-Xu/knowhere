@@ -85,12 +85,13 @@ text, a literal marker:
   **Format trap**: `<owner_section_path>` inside the marker is written
   verbatim by the parser and stored as-is — it is the on-disk path
   (`"<source_file_name>/<Heading>/<Heading>/..."`, plain `/`, filename
-  included), **not** the DB `section_path` you get back from `outline` /
-  `node_filter` / `recall` (which is `" / "`-joined and excludes the
-  filename). Do not string-match the marker directly against a DB
-  `section_path`. Convert it first — `section_path_from_chunk_path()` in
-  `search/lexical_text.py` already does this conversion and is the function
-  to reuse when implementing marker resolution, not a new one.
+  included), **not** the DB `section_path` you get back from
+  `corpus.outline` / `corpus.node_filter` / `corpus.recall` (which is
+  `" / "`-joined and excludes the filename). Do not string-match the
+  marker directly against a DB `section_path`. Convert it first —
+  `section_path_from_chunk_path()` in `search/lexical_text.py` already
+  does this conversion and is the function to reuse when implementing
+  marker resolution, not a new one.
 
 ## 3. Asset chunks: `image` / `table`, and `connect_to`
 
@@ -105,9 +106,12 @@ list on the **body chunk**, not a location on the asset:
   the owning section).
 
 This link is **one-directional** (body → asset). There is no stored
-asset → body back-link; to find which section(s) an asset belongs to, use
-the reverse lookup on the `assets` tool rather than assuming the asset chunk
-itself names its host.
+asset → body back-link. `corpus.grep`, `corpus.recall`, and `corpus.assets`
+resolve the host through that body link and print the hosting
+`section_path` on the asset row. If no host is found, the row keeps
+`Root` and is marked as having no host section. Use `corpus.assets`
+`host_of` to list every host, rather than reading the asset's stored
+path.
 
 ## 4. Document graph
 
@@ -131,77 +135,82 @@ for anything finer-grained than a document pair.
 ## 6. Tools and how they work together
 
 Every tool exists to find the `section_path`s (or asset `chunk_id`s) that
-answer the query, then hand them to `read`. Exact call parameters live only
-in each tool's own schema/description (ask for that, do not memorize names
-here) — this section is the collaboration map: which tools narrow a search
-space, which produce hits, and what to do with either kind of result.
+answer the query, then hand them to `corpus.read`. Names below are the
+registered names (`corpus.outline`). MCP clients call those names as-is.
+Exact call parameters live only in each tool's own schema/description
+(ask for that, do not memorize names here) — this section is the
+collaboration map: which tools narrow a search space, which produce hits,
+and what to do with either kind of result.
 
 ```mermaid
 flowchart LR
     subgraph MapNarrowing["Narrow a map (overview / structural predicate)"]
-        outline
-        node_filter
+        outline["corpus.outline"]
+        node_filter["corpus.node_filter"]
     end
     subgraph LeafHits["Find hits (exact string / fuzzy / asset listing)"]
-        grep
-        recall
-        assets
+        grep["corpus.grep"]
+        recall["corpus.recall"]
+        assets["corpus.assets"]
     end
     outline -->|narrows scope for| LeafHits
     node_filter -->|narrows scope for| LeafHits
-    MapNarrowing -->|section_path| finish
-    MapNarrowing -->|section_path| read
+    MapNarrowing -->|section_path| read["corpus.read"]
     LeafHits -->|section_path or chunk_id| read
-    read -->|table too large| query_table
+    read -->|table too large| query_table["corpus.query_table"]
     read --> finish
     query_table --> finish
-    list_documents["list_documents (namespace inventory, standalone)"]
-    neighbors["neighbors (related documents, standalone)"]
+    list_documents["corpus.list_documents (namespace inventory, standalone)"]
+    neighbors["corpus.neighbors (related documents, standalone)"]
 ```
 
-**`outline` and `node_filter`** are the two map-narrowing tools: both take
-one or more scope targets (a whole document, or a section and everything
-under it) and return the *same* row shape — every `section_path` in that
-scope, indented by level, with title/summary. `outline` returns that
-unconditionally (the outline of what is there); `node_filter` returns it
-only for the branches around a structural predicate match (marked as a
-hit), still shown as full context (ancestors + the entire matched subtree),
-not a bare list of matches. Either one's result is a legitimate final
-answer on its own — cite a `section_path` from it directly via `finish` — or
-a starting point to `read` a specific branch, or a scope to hand to a
-leaf-hit tool below. Neither is callable on a single leaf section with
-nothing under it; `read` that directly instead.
+**`corpus.outline` and `corpus.node_filter`** are the two map-narrowing
+tools: both take one or more scope targets (a whole document, or a section
+and everything under it) and return the *same* row shape — every
+`section_path` in that scope, indented by level, with title/summary.
+`corpus.outline` returns that unconditionally (the outline of what is
+there); `corpus.node_filter` returns it only for the branches around a
+structural predicate match (marked as a hit), still shown as full context
+(ancestors + the entire matched subtree), not a bare list of matches. Use
+a returned `section_path` to `corpus.read` a branch, or as the scope of a
+`corpus.grep` / `corpus.recall` / `corpus.assets` call. Neither is
+callable on a single leaf section with nothing under it; `corpus.read`
+that directly instead.
 
-**`grep`, `recall`, and `assets`** are the leaf-hit tools: they search
-*within* a scope (the whole corpus, or one narrowed by a prior
-`outline`/`node_filter` call) and return rows pointing at specific
-sections/chunks, not a map. `grep` is exact-string; `recall` is fuzzy
-ranked search; `assets` lists image/table chunks by type — on its own it is
-an unfiltered listing with no way to judge relevance, so pair it with a
-prior `grep`/`recall` hit (scope to that hit's section, or reverse-resolve
-the hit's own asset references) rather than browsing every asset in a
-document. Grep does not scan table-cell HTML — a table only surfaces from
-`grep`/`recall` via its published summary/keywords/caption, never by a
-literal cell value; find the table via `assets` (or a `grep`/`recall` hit on
-the surrounding body text) and use `read`/`query_table` to inspect its
-cells. Every hit row names a `document_id` plus either a `section_path`
-(body hits) or a `chunk_id` (image/table hits, whose stored `section_path`
-is always the document root, not where they visually belong) — read
-whichever one applies with `read` next, then decide pick or no-pick for
-that ref immediately from `read`'s own per-ref status.
+**`corpus.grep`, `corpus.recall`, and `corpus.assets`** are the leaf-hit
+tools: they search *within* a scope (the whole corpus, or one narrowed by
+a prior `corpus.outline`/`corpus.node_filter` call) and return rows
+pointing at specific sections/chunks, not a map. `corpus.grep` is exact
+string (several terms are any-match / OR, rows stay in document order,
+not relevance order); `corpus.recall` is fuzzy ranked search;
+`corpus.assets` lists image/table chunks by type — on its own it is an
+unfiltered listing with no way to judge relevance, so pair it with a
+prior `corpus.grep`/`corpus.recall` hit (scope to that hit's section, or
+reverse-resolve the hit's own asset references) rather than browsing
+every asset in a document. Grep does not scan table-cell HTML — a table
+only surfaces from `corpus.grep`/`corpus.recall` via its published
+summary/keywords/caption, never by a literal cell value; find the table
+via `corpus.assets` (or a hit on the surrounding body text) and use
+`corpus.read`/`corpus.query_table` to inspect its cells. Every hit row
+names a `document_id` plus either a `section_path` (body hits) or a
+`chunk_id` (image/table hits). Image/table rows show the hosting
+section, not the asset's stored `Root` path — read whichever address
+applies with `corpus.read` next, then decide pick or no-pick for that
+ref immediately from `corpus.read`'s own per-ref status.
 
-**`read`** is where body content actually gets consumed: it accepts many
-refs at once (mixing map-tool section_paths and leaf-hit chunk_ids), and
-reports each ref's outcome separately so a failed ref does not hide a
-successful one. A table `read` reports as too large points at
-**`query_table`** for cell-level `SELECT`s over that same table.
+**`corpus.read`** is where body content actually gets consumed: it accepts
+many refs at once (mixing map-tool section_paths and leaf-hit chunk_ids),
+and reports each ref's outcome separately so a failed ref does not hide a
+successful one. A table `corpus.read` reports as too large points at
+**`corpus.query_table`** for cell-level `SELECT`s over that same table.
 
-**`list_documents`** and **`neighbors`** stand outside this flow:
-`list_documents` is a namespace-wide inventory (only for an explicit
-"list/inventory the documents" request, never a cold-start for a content
-question); `neighbors` returns document-level related edges (§4), unscoped
-by section.
+**`corpus.list_documents`** and **`corpus.neighbors`** stand outside this
+flow: `corpus.list_documents` is a namespace-wide inventory (only for an
+explicit "list/inventory the documents" request, never a cold-start for a
+content question); `corpus.neighbors` returns document-level related
+edges (§4), unscoped by section.
 
-General rule: narrow with `outline`/`node_filter` before searching a large
-corpus; prefer `grep` over `recall` when you know the exact string you are
-looking for, and fall back to `recall` only for genuinely fuzzy questions.
+General rule: narrow with `corpus.outline`/`corpus.node_filter` before
+searching a large corpus; prefer `corpus.grep` over `corpus.recall` when
+you know the exact string you are looking for, and fall back to
+`corpus.recall` only for genuinely fuzzy questions.

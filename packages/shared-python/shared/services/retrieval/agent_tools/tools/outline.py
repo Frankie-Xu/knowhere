@@ -1,8 +1,7 @@
 """``corpus.outline`` — titles + summaries, no body text.
 
-Reads ``document_sections`` (+ a ``document_chunks`` count aggregate) for one
-or more scope targets' current revision, each optionally narrowed to a
-section subtree. This queries the live tables directly rather than the
+Reads ``document_sections`` for one or more scope targets' current
+revision, each optionally narrowed to a section subtree. This queries the live tables directly rather than the
 compressed ``RetrievalNamespaceMapSnapshot``/serving-manifest blob: that
 snapshot is namespace-wide and decoding it to read one document's subtree
 would cost more than this document-scoped, index-backed query.
@@ -13,18 +12,18 @@ outline value — rejected up front instead, pointing at ``corpus.read``.
 
 The rendered map (one row per section, same shape ``corpus.node_filter``
 uses — see ``agent_tools.snippet``) is never truncated mid-text. Past
-``registry.MAP_TOOL_CHAR_BUDGET`` chars it is lit and folded by
-``agent_tools.map_render``: the top-scored sections are marked ``[Hit]`` and
-kept with their ancestors; low-relevance subtrees become placeholders.
+``registry.MAP_TOOL_CHAR_BUDGET`` chars it shrinks in
+``agent_tools.map_render``: summaries are dropped first, then low-scoring
+subtrees become placeholders, then the call fails as too large.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
-from shared.models.database.document import Document, DocumentChunk, DocumentSection
+from shared.models.database.document import Document, DocumentSection
 from shared.services.retrieval.agent_tools.map_render import render_map
 from shared.services.retrieval.agent_tools.registry import (
     ToolContext,
@@ -43,7 +42,7 @@ from shared.services.retrieval.agent_tools.snippet import build_row
     description=(
         "Map what a document (or one of its sections) covers: every "
         "section_path beneath a scope target, any depth, with title + "
-        "summary + chunk_count, indented by level — no body text. Use this "
+        "summary, indented by level — no body text. Use this "
         "for 'what does this document/section cover' questions, not for "
         "finding an answer to a specific fact (use corpus.recall/corpus.grep "
         "for that). Accepts several scope targets in one call. Each target "
@@ -52,11 +51,12 @@ from shared.services.retrieval.agent_tools.snippet import build_row
         "children is rejected; read it directly with corpus.read instead. "
         "Use the returned section_paths to corpus.read the ones that matter, "
         "or as the scope of a corpus.grep/corpus.recall/corpus.assets call. "
-        "A result over 20,000 chars is folded, not cut off: the sections that "
-        "best match the user's question are marked [Hit] and kept with their "
-        "parents, and low-relevance subtrees are hidden behind a 'hidden N "
-        "nodes' placeholder — re-scope to that section_path to expand it. If "
-        "even that does not fit, the call fails and asks for a narrower scope."
+        "A result over 20,000 chars is shrunk, not cut off: summaries are "
+        "omitted first; if it is still too long, the lowest-relevance "
+        "subtrees are hidden behind a 'hidden N nodes' placeholder — "
+        "re-scope to that section_path to expand it. If even that does not "
+        "fit, the call fails: the scope is too large to map, so use "
+        "corpus.grep, corpus.recall or corpus.assets on the same scope."
     ),
     json_schema={
         "type": "object",
@@ -152,19 +152,7 @@ async def outline(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         if depth is not None:
             scoped = [s for s in scoped if (s.section_level - base_level) <= depth]
 
-        section_ids = [s.section_id for s in scoped]
-        scoped_ids = set(section_ids)
-
-        chunk_counts: dict[str, int] = {}
-        if section_ids:
-            count_rows = await ctx.db.execute(
-                select(DocumentChunk.section_id, func.count(DocumentChunk.id))
-                .where(DocumentChunk.document_id == target.document_id)
-                .where(DocumentChunk.job_result_id == target.job_result_id)
-                .where(DocumentChunk.section_id.in_(section_ids))
-                .group_by(DocumentChunk.section_id)
-            )
-            chunk_counts = {str(sid): int(count) for sid, count in count_rows.all()}
+        scoped_ids = {s.section_id for s in scoped}
 
         for section in scoped:
             parent_id = (
@@ -177,7 +165,6 @@ async def outline(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 document_id=target.document_id,
                 section_path=section.section_path,
                 title=section.section_title,
-                chunk_count=chunk_counts.get(section.section_id, 0),
                 summary=section.summary or "",
                 depth=section.section_level - base_level,
             )

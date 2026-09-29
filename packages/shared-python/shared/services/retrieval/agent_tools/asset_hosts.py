@@ -21,6 +21,7 @@ from shared.models.database.document import Document, DocumentChunk, DocumentSec
 from shared.services.retrieval.agent_tools.registry import ToolContext
 from shared.services.retrieval.agent_tools.scope import ScopeTarget
 from shared.services.retrieval.hydration.row_utils import iter_connected_target_ids
+from shared.services.retrieval.settings import ASSET_CHUNK_TYPES
 
 _BODY_CHUNK_TYPES = ("text", "page")
 
@@ -133,3 +134,30 @@ def hosted_section_path(
     if candidates:
         return candidates[0].section_path, True
     return str(stored_path or "Root"), False
+
+
+async def host_paths_for_hits(
+    ctx: ToolContext,
+    hits: list[dict[str, Any]],
+    scope: list[ScopeTarget],
+) -> dict[AssetKey, tuple[str, bool]]:
+    """``(section_path, hosted)`` for every image/table hit, same rule as assets."""
+    asset_hits = [
+        hit
+        for hit in hits
+        if str(hit.get("chunk_type") or "").strip() in ASSET_CHUNK_TYPES
+    ]
+    if not asset_hits:
+        return {}
+    hosts = await load_asset_hosts(
+        ctx,
+        document_ids={str(hit.get("document_id") or "") for hit in asset_hits},
+        asset_ids={str(hit.get("chunk_id") or "") for hit in asset_hits},
+    )
+    resolved: dict[AssetKey, tuple[str, bool]] = {}
+    for hit in asset_hits:
+        key = (str(hit.get("document_id") or ""), str(hit.get("chunk_id") or ""))
+        resolved[key] = hosted_section_path(
+            hosts, key, scope, stored_path=hit.get("section_path")
+        )
+    return resolved

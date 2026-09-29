@@ -5,7 +5,7 @@ window + tail, ``...``-joined, overlap-merged. Only the first match is
 windowed.
 
 ``build_row`` / ``format_row`` are the one row shape every tool shares —
-outline/node_filter (map rows: indented, ``summary``, ``chunk_count``),
+outline/node_filter (map rows: indented, ``summary``),
 grep/recall (hit rows: flat, ``snippet``, ``score``), and assets (asset rows:
 ``chunk_id`` plus the hosting ``section_path``) all build the same record for
 ``payload["rows"]`` and render it the same way, so a model reads one row
@@ -82,7 +82,6 @@ def build_row(
     section_path: object,
     title: object = "",
     chunk_id: object | None = None,
-    chunk_count: int | None = None,
     summary: str = "",
     snippet: str = "",
     score: float | None = None,
@@ -98,9 +97,9 @@ def build_row(
     on one). For ``image``/``table`` rows ``section_path`` is the *hosting*
     section, and ``hosted`` says whether a host was found (``False`` keeps
     the asset's own ``Root`` path); it is ``None`` for every other kind.
-    ``chunk_count``/``summary`` are map-row fields; ``snippet``/``score`` are
-    hit-row fields; ``depth`` indents a map row under its parent; ``is_hit``
-    marks a row lit up by node_filter/lighting scoring.
+    ``summary`` is a map-row field; ``snippet``/``score`` are hit-row
+    fields; ``depth`` indents a map row under its parent; ``is_hit`` marks a
+    node_filter predicate match.
     """
     return {
         "kind": kind,
@@ -108,7 +107,6 @@ def build_row(
         "document_id": str(document_id),
         "section_path": str(section_path),
         "chunk_id": str(chunk_id) if chunk_id else None,
-        "chunk_count": chunk_count,
         "summary": summary,
         "snippet": snippet,
         "score": score,
@@ -129,8 +127,6 @@ def format_row(row: Mapping[str, Any]) -> str:
         header += " (no host section)"
     if row["chunk_id"]:
         header += f" chunk_id={row['chunk_id']}"
-    if row["chunk_count"] is not None:
-        header += f" (chunks={row['chunk_count']})"
     if row["score"] is not None:
         header += f" score={row['score']}"
     if row["is_hit"]:

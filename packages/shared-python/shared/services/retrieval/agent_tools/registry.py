@@ -110,8 +110,9 @@ class ToolContext:
     # to score and fold an oversized map (``scoring/map_lighting.py``) — never
     # by hit tools, which already take their own ``query``/``pattern``.
     # Empty when a caller (e.g. an external MCP client hitting a single
-    # ``corpus.*`` tool directly) has no such query: lighting then fails
-    # that one call with a "narrow scope" error instead of guessing.
+    # ``corpus.*`` tool directly) has no such query: an oversized map that
+    # dropping summaries does not fit then fails that one call as "too
+    # large to map" instead of guessing.
     query: str = ""
 
 

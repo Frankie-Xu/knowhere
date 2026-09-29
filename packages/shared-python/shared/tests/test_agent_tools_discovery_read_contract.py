@@ -199,7 +199,7 @@ def _read_kwargs(refs: list[dict[str, str]]) -> dict:
 
 
 def _section_paths_from_outline_text(text: str) -> list[str]:
-    return re.findall(r"section_path=(.+?) \(chunks=", text)
+    return re.findall(r"section_path=(.+?)(?: \[Hit\])?$", text, re.MULTILINE)
 
 
 def _asset_refs_from_text(text: str) -> list[dict[str, str]]:

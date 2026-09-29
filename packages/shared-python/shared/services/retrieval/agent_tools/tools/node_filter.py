@@ -11,17 +11,18 @@ is each matched section's full ancestor chain (context) plus its entire
 descendant subtree, in the same map-row shape ``corpus.outline`` uses (see
 ``agent_tools.snippet``) — this is a map-narrowing tool, the same family as
 ``outline``, not a search hit list. Matched rows are marked ``[Hit]``. Past
-``registry.MAP_TOOL_CHAR_BUDGET`` chars the map is folded by
-``agent_tools.map_render`` with every hit protected: a hit and its ancestor
-chain are never folded away, but low-relevance branches under a hit can be
-hidden behind a placeholder.
+``registry.MAP_TOOL_CHAR_BUDGET`` chars the map shrinks in
+``agent_tools.map_render``: summaries are dropped first, then low-scoring
+context is folded with every hit kept: a hit and its ancestor chain are
+never folded away, but low-relevance branches under a hit can be hidden
+behind a placeholder.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from shared.models.database.document import DocumentChunk, DocumentSection
 from shared.services.retrieval.agent_tools.map_render import render_map
@@ -60,10 +61,12 @@ from shared.services.retrieval.scoring.node_filter_predicates import (
         "within one predicate's 'terms' list OR together. Use the returned "
         "section_paths to corpus.read the ones that matter, or as the scope "
         "of a corpus.grep/corpus.recall/corpus.assets call. A result over "
-        "20,000 chars is folded, not cut off: every [Hit] row and its parents "
-        "stay, low-relevance context subtrees are hidden behind a 'hidden N "
-        "nodes' placeholder. If the hits alone do not fit, the call fails and "
-        "asks for a narrower scope or stricter predicates."
+        "20,000 chars is shrunk, not cut off: summaries are omitted first; "
+        "if it is still too long, every [Hit] row and its parents stay and "
+        "low-relevance context subtrees are hidden behind a 'hidden N "
+        "nodes' placeholder. If the hits alone do not fit, the call fails: "
+        "the scope is too large to map, so use corpus.grep, corpus.recall or "
+        "corpus.assets on the same scope."
     ),
     json_schema={
         "type": "object",
@@ -217,14 +220,6 @@ async def node_filter(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 ):
                     visible_ids.add(section.section_id)
 
-        count_rows = await ctx.db.execute(
-            select(DocumentChunk.section_id, func.count(DocumentChunk.id))
-            .where(DocumentChunk.document_id == target.document_id)
-            .where(DocumentChunk.job_result_id == target.job_result_id)
-            .where(DocumentChunk.section_id.in_(sorted(visible_ids)))
-            .group_by(DocumentChunk.section_id)
-        )
-        chunk_counts = {str(sid): int(count) for sid, count in count_rows.all()}
         base_level = min(s.section_level for s in doc_sections)
 
         for section in doc_sections:
@@ -235,7 +230,6 @@ async def node_filter(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 document_id=target.document_id,
                 section_path=section.section_path,
                 title=section.section_title,
-                chunk_count=chunk_counts.get(section.section_id, 0),
                 summary=section.summary or "",
                 depth=section.section_level - base_level,
                 is_hit=section.section_id in hit_ids,
@@ -267,7 +261,7 @@ async def node_filter(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         rows_by_id=rows_by_id,
         revision_by_document=revision_by_doc,
         header=header,
-        protected_ids=matched_ids,
+        keep_ids=matched_ids,
     )
     if rendered.error is not None:
         return ToolResult(text="", error=rendered.error)

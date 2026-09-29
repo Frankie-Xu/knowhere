@@ -63,10 +63,9 @@ async def load_leaf_unit_scores(
 
     Returns ``None`` when the map cannot be scored at all: the query has no
     rankable token, no rendered section has a map unit on its current
-    revision, or some revision lacks a compatible map-unit index. Folding
-    on all-zero scores would hide arbitrary branches, so callers fail the
-    call instead. A section that simply has no unit of its own is absent
-    from the mapping and scores ``0.0``.
+    revision, or some     revision lacks a compatible map-unit index; callers fail the call
+    instead of folding unscored. A section that simply has no unit of its
+    own is absent from the mapping and scores ``0.0``.
     """
     query_tokens = tokenize_query_for_ranker(query)
     if not query_tokens or not section_ids or not revision_by_document:
@@ -223,17 +222,11 @@ def pool_scores_to_tree(
     return pooled
 
 
-MAP_LIGHT_HIT_COUNT = 5
-
-
-def top_hit_ids(leaf_scores: dict[str, float], *, limit: int = MAP_LIGHT_HIT_COUNT) -> list[str]:
-    """The highest positive own-scores — the rows lighting marks ``[Hit]``
-    and never folds away."""
-    ranked = sorted(
-        ((score, section_id) for section_id, score in leaf_scores.items() if score > 0),
-        key=lambda item: (-item[0], item[1]),
-    )
-    return [section_id for _, section_id in ranked[:limit]]
+def best_score_ids(pooled: dict[str, float]) -> set[str]:
+    """Every section whose pooled score equals the best one — the best chain
+    (max-pooling gives each ancestor at least its best descendant's score)."""
+    best = max(pooled.values(), default=0.0)
+    return {section_id for section_id, score in pooled.items() if score == best}
 
 
 _TOP_LEVEL_KEY = "<root>"
@@ -301,17 +294,18 @@ def fold_map_nodes(
     nodes: list[MapNode],
     *,
     char_budget: int,
-    protected_ids: set[str] | frozenset[str] = frozenset(),
+    keep_ids: set[str] | frozenset[str] = frozenset(),
 ) -> FoldResult:
     """Hide lowest-score subtrees until the joined map lines fit ``char_budget``.
 
-    Every id in ``protected_ids`` and all of its ancestors are never hidden;
-    a subtree is a removal candidate only when no protected row lies in it.
-    Candidates go lowest score first, largest subtree first among ties.
-    The budget counts the placeholder rows left behind, not just the
-    visible rows. ``overflow`` is set when the rows that must stay (plus
-    their placeholders) still exceed ``char_budget``; the caller fails the
-    call rather than hiding a protected row or cutting text.
+    Every id in ``keep_ids`` and all of its ancestors are never hidden;
+    a subtree is a removal candidate only when no kept row lies in it.
+    Candidates go lowest score first; ties follow the archived MAP-NAV
+    order (``_apply_budget_hide``): most descendants first, then deepest
+    first, then ``section_id``. The budget counts the placeholder rows left
+    behind, not just the visible rows. ``overflow`` is set when the rows
+    that must stay (plus their placeholders) still exceed ``char_budget``;
+    the caller fails the call rather than hiding a kept row or cutting text.
     """
     by_id = {node.section_id: node for node in nodes}
     children_by_parent: dict[str, list[str]] = {}
@@ -322,8 +316,8 @@ def fold_map_nodes(
             )
 
     keep: set[str] = set()
-    for protected_id in protected_ids:
-        current = by_id.get(protected_id)
+    for kept_id in keep_ids:
+        current = by_id.get(kept_id)
         while current is not None and current.section_id not in keep:
             keep.add(current.section_id)
             current = by_id.get(current.parent_section_id or "")
@@ -356,7 +350,8 @@ def fold_map_nodes(
         (node for node in nodes if node.section_id not in keep),
         key=lambda node: (
             node.score,
-            -sum(row_chars[sid] for sid in subtree_ids(node.section_id)),
+            -(len(subtree_ids(node.section_id)) - 1),
+            -node.depth,
             node.section_id,
         ),
     )

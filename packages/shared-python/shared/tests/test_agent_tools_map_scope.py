@@ -159,7 +159,7 @@ def _seed(session: Session) -> None:
                 2,
                 2,
                 "sec_overview",
-                "hit-marker-findings",
+                "hit-marker-findings " + "long summary text " * 12,
             ),
             section("sec_detail", DOC_A, REV_A, PATH_DETAIL, "Detail", 3, 3, "sec_findings"),
             section("sec_treatment", DOC_A, REV_A, PATH_TREATMENT, "2 Treatment", 1, 4, "sec_root"),
@@ -291,43 +291,42 @@ async def test_node_filter_keeps_ancestors_and_full_descendant_subtree(
 
 
 @pytest.mark.asyncio
-async def test_outline_folds_over_char_budget_and_shows_hidden_count(
+async def test_outline_over_budget_drops_summaries_before_anything_else(
     map_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "shared.services.retrieval.agent_tools.tools.outline.MAP_TOOL_CHAR_BUDGET",
-        80,
-    )
-
-    async def _scores(*_args: object, **_kwargs: object) -> dict[str, float]:
-        return {
-            "sec_overview": 10.0,
-            "sec_findings": 10.0,
-            "sec_detail": 10.0,
-            "sec_treatment": 0.0,
-        }
+    whole = await outline(map_ctx, {"scope": [{"document_id": DOC_A}]})
+    assert whole.error is None
+    assert "summary: hit-marker-findings" in whole.text
+    assert "summaries omitted" not in whole.text
 
     monkeypatch.setattr(
-        "shared.services.retrieval.agent_tools.tools.outline.load_leaf_unit_scores",
-        _scores,
+        "shared.services.retrieval.agent_tools.map_render.MAP_TOOL_CHAR_BUDGET",
+        len(whole.text) - 10,
     )
+    map_ctx.query = ""
     result = await outline(map_ctx, {"scope": [{"document_id": DOC_A}]})
     assert result.error is None
-    assert "folded" in result.text
-    assert "hidden" in result.text
-    assert PATH_TREATMENT not in result.text or "hidden" in result.text
+    assert "summary:" not in result.text
+    assert "summaries omitted" in result.text
+    assert PATH_TREATMENT in result.text
+    assert all(row["summary"] == "" for row in result.payload["rows"])
 
 
 @pytest.mark.asyncio
-async def test_outline_over_budget_without_query_fails(map_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_outline_too_large_without_query_points_to_grep_recall_assets(
+    map_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(
-        "shared.services.retrieval.agent_tools.tools.outline.MAP_TOOL_CHAR_BUDGET",
+        "shared.services.retrieval.agent_tools.map_render.MAP_TOOL_CHAR_BUDGET",
         80,
     )
     map_ctx.query = ""
     result = await outline(map_ctx, {"scope": [{"document_id": DOC_A}]})
     assert result.error is not None
-    assert "no query" in result.error
+    assert "no user query" in result.error
+    assert "corpus.grep" in result.error
+    assert "corpus.recall" in result.error
+    assert "corpus.assets" in result.error
 
 
 @pytest.mark.asyncio
@@ -384,16 +383,29 @@ async def test_assets_subtree_scope_keeps_only_connected_in_scope_assets(
 
 
 def test_fold_at_map_tool_budget_hides_low_score_keeps_hit_chain() -> None:
-    hit = MapNode("findings", "overview", render="H" * 8000, score=float("inf"))
-    ancestor = MapNode("overview", "root", render="A" * 100, score=float("inf"))
-    root = MapNode("root", None, render="R" * 50, score=float("inf"))
-    low = MapNode("treatment", "root", render="L" * 15000, score=0.0)
-    visible, hidden = fold_map_nodes(
-        [root, ancestor, hit, low], char_budget=MAP_TOOL_CHAR_BUDGET
+    hit = MapNode("findings", "overview", render="H" * 8000, depth=2, score=5.0)
+    ancestor = MapNode("overview", "root", render="A" * 100, depth=1, score=5.0)
+    root = MapNode("root", None, render="R" * 50, score=5.0)
+    low = MapNode("treatment", "root", render="L" * 15000, depth=1, score=0.0)
+    folded = fold_map_nodes(
+        [root, ancestor, hit, low],
+        char_budget=MAP_TOOL_CHAR_BUDGET,
+        keep_ids={"findings"},
     )
-    ids = [node.section_id for node in visible]
-    assert "findings" in ids
-    assert "overview" in ids
-    assert "root" in ids
-    assert "treatment" not in ids
-    assert hidden["root"] >= 1
+    assert not folded.overflow
+    assert {"findings", "overview", "root"} <= folded.visible_ids
+    assert "treatment" not in folded.visible_ids
+    assert folded.hidden_count == 1
+
+
+def test_fold_ties_hide_larger_then_deeper_subtree_first() -> None:
+    root = MapNode("root", None, render="R" * 10)
+    small = MapNode("small", "root", render="S" * 100, depth=1)
+    big = MapNode("big", "root", render="B" * 100, depth=1)
+    big_child = MapNode("big_child", "big", render="C" * 100, depth=2)
+    folded = fold_map_nodes(
+        [root, small, big, big_child],
+        char_budget=250,
+        keep_ids={"root"},
+    )
+    assert folded.visible_ids == {"root", "small"}

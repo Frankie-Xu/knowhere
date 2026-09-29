@@ -27,15 +27,22 @@ from sqlalchemy import func, or_, select
 
 from shared.models.database.document import Document, DocumentChunk, DocumentSection
 from shared.models.database.job_result import JobResult
+from shared.services.retrieval.agent_tools.asset_hosts import host_paths_for_hits
 from shared.services.retrieval.agent_tools.explore_mount import mount_explore_hits
 from shared.services.retrieval.agent_tools.registry import (
     ToolContext,
     ToolResult,
     capped_limit,
+    chunk_types_schema,
     register_tool,
 )
-from shared.services.retrieval.agent_tools.scope import SCOPE_SCHEMA, resolve_scope, scope_orm_clause
-from shared.services.retrieval.agent_tools.snippet import build_snippet, format_row
+from shared.services.retrieval.agent_tools.scope import (
+    SCOPE_SCHEMA,
+    ScopeTarget,
+    resolve_scope,
+    scope_orm_clause,
+)
+from shared.services.retrieval.agent_tools.snippet import build_row, build_snippet, format_row
 from shared.services.retrieval.settings import ASSET_CHUNK_TYPES
 
 _DEFAULT_LIMIT = 30
@@ -95,8 +102,9 @@ def _term_search(terms: list[str]) -> tuple[re.Pattern[str], Any]:
         "term, or 'patterns' for several candidate terms OR'd together in "
         "this single call (e.g. synonyms) — issue one call with multiple "
         "terms instead of several parallel corpus.grep calls for different "
-        "terms in the same turn. At least one of pattern/patterns is "
-        "required."
+        "terms in the same turn. Several terms are any-match (OR), and "
+        "rows stay in document order — this tool does not rank by "
+        "relevance. At least one of pattern/patterns is required."
     ),
     json_schema={
         "type": "object",
@@ -108,21 +116,25 @@ def _term_search(terms: list[str]) -> tuple[re.Pattern[str], Any]:
             "patterns": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Several search terms OR'd together in this one call.",
+                "description": (
+                    "Several search terms OR'd together in this one call. "
+                    "A chunk matches if any term hits. Results stay in "
+                    "document order, not relevance order."
+                ),
             },
             "scope": SCOPE_SCHEMA,
-            "chunk_types": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Restrict hits to these chunk types (text, page, image, table).",
-            },
+            "chunk_types": chunk_types_schema(
+                "Restrict hits to these chunk types. Old type names are rejected."
+            ),
             "context_chars": {
                 "type": "integer",
+                "minimum": 1,
                 "default": _DEFAULT_CONTEXT_CHARS,
                 "description": "Characters of context around the first match in the snippet.",
             },
             "limit": {
                 "type": "integer",
+                "minimum": 1,
                 "default": _DEFAULT_LIMIT,
                 "description": "Max rows to return. The total match count is still reported.",
             },
@@ -145,9 +157,10 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         str(t).strip().lower() for t in (args.get("chunk_types") or []) if str(t).strip()
     }
 
+    scope: list[ScopeTarget] = []
     scope_filter = None
     if args.get("scope") is not None:
-        targets, scope_error = await resolve_scope(
+        scope, scope_error = await resolve_scope(
             ctx.db,
             user_id=ctx.user_id,
             namespace=ctx.namespace,
@@ -157,7 +170,7 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         if scope_error is not None:
             return ToolResult(text="", error=f"grep: {scope_error}")
         scope_filter = scope_orm_clause(
-            targets,
+            scope,
             document_id_col=DocumentChunk.document_id,
             section_path_col=DocumentSection.section_path,
         )
@@ -270,29 +283,43 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         results, media = await mount_explore_hits(
             ctx, results, char_budget=ctx.budget.max_chars
         )
+    host_paths = await host_paths_for_hits(ctx, results, scope)
 
+    rows: list[dict[str, Any]] = []
     lines = [f"total_matches={total_matches} returned={len(results)}"]
     if requested_limit > limit:
         lines.append(f"note: capped to budget.max_items={ctx.budget.max_items}")
     for r in results:
         chunk_type = str(r["chunk_type"] or "").strip()
-        lines.append(
-            format_row(
-                kind=chunk_type or "text",
-                document_id=r["document_id"],
-                section_path=r["section_path"],
-                title=r["source_file_name"],
-                chunk_id=r["chunk_id"] if chunk_type in ASSET_CHUNK_TYPES else None,
-                snippet=r["snippet"],
-            )
+        is_asset = chunk_type in ASSET_CHUNK_TYPES
+        key = (str(r["document_id"]), str(r["chunk_id"]))
+        section_path, hosted = (
+            host_paths[key] if is_asset and key in host_paths else (r["section_path"], None)
         )
+        row = build_row(
+            kind=chunk_type or "text",
+            document_id=r["document_id"],
+            section_path=section_path,
+            title=r["source_file_name"],
+            chunk_id=r["chunk_id"] if is_asset else None,
+            snippet=r["snippet"],
+            hosted=hosted if is_asset else None,
+        )
+        rows.append(row)
+        lines.append(format_row(row))
         rendered = str(r.get("rendered") or "").strip()
         if rendered:
             lines.append(rendered)
 
     return ToolResult(
         text="\n".join(lines),
-        payload={"total_matches": total_matches, "results": results},
+        payload={
+            "rows": rows,
+            "details": {
+                "total_matches": total_matches,
+                "capped": requested_limit > limit,
+            },
+        },
         refs=[
             {"document_id": r["document_id"], "chunk_id": r["chunk_id"]} for r in results
         ],

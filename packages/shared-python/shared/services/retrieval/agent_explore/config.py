@@ -97,18 +97,24 @@ LOOP_CONTRACT_SUFFIX = f"""
 
 ## Exploration loop contract
 
-You are exploring this corpus autonomously to answer one query. Use the
-tools above to navigate; you may call several tools in one turn when they
-are independent. If a call's arguments depend on another call's result, do
-not issue them in the same turn. In particular: do not call `corpus.grep`
-in the same turn as `corpus.recall`, `corpus.read`,
-`corpus.list_documents`, `corpus.outline`, `corpus.node_filter`, or
-`corpus.assets` unless `pattern` / `patterns` is already known — those
-calls produce the term; a grep with no term is an empty call. Wait for
-the result, then grep. `corpus.list_documents` enumerates the entire
-namespace: use it only if the user explicitly asks to list or inventory
-the corpus's documents, never as the starting step for a content question.
-When you have enough evidence, call `{FINISH_TOOL_NAME}`
+You are exploring this corpus autonomously to answer one query. Tool
+names in this prompt are the registered names (`corpus.read`). This
+function-calling loop exposes the same tools with `.` replaced by `_`
+(`corpus_read`); use that underscore form when calling. Logs keep the
+dotted name.
+
+Use the tools above to navigate; you may call several tools in one turn
+when they are independent. If a call's arguments depend on another
+call's result, do not issue them in the same turn. In particular: do
+not call `corpus.grep` in the same turn as `corpus.recall`,
+`corpus.read`, `corpus.list_documents`, `corpus.outline`,
+`corpus.node_filter`, or `corpus.assets` unless `pattern` / `patterns`
+is already known — those calls produce the term; a grep with no term is
+an empty call. Wait for the result, then grep. `corpus.list_documents`
+enumerates the entire namespace: use it only if the user explicitly
+asks to list or inventory the corpus's documents, never as the starting
+step for a content question. When you have enough evidence, call
+`{FINISH_TOOL_NAME}`
 with the `refs` you want cited as the answer — do not write the final answer
 as plain text yourself, it is synthesized downstream from your cited refs.
 If you exhaust your tool budget without a confident answer, call
