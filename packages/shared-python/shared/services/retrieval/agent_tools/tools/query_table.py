@@ -37,14 +37,21 @@ from shared.services.retrieval.settings import QUERY_TABLE_NAME
     json_schema={
         "type": "object",
         "properties": {
-            "document_id": {"type": "string"},
-            "chunk_id": {"type": "string"},
+            "document_id": {
+                "type": "string",
+                "description": "Document owning the table chunk.",
+            },
+            "chunk_id": {
+                "type": "string",
+                "description": "The table chunk_id, from a prior read/recall/grep row.",
+            },
             "sql": {
                 "type": "string",
                 "description": "A single SELECT. LIMIT is added when omitted.",
             },
         },
         "required": ["document_id", "chunk_id", "sql"],
+        "additionalProperties": False,
     },
 )
 async def query_table(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
