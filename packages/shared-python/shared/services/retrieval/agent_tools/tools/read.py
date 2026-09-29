@@ -234,42 +234,6 @@ def _collect_https_image_media(
     return media
 
 
-def _normalize_read_refs(args: dict[str, Any]) -> list[Any]:
-    """Accept the canonical ``refs`` list, or a flat single-document shorthand.
-
-    Deterministic, not model-guessing: observed live tool calls sometimes
-    hoist ``document_id`` to the top level alongside ``section_path(s)`` /
-    ``chunk_id(s)`` instead of nesting each pair inside ``refs`` — the exact
-    shape the ``json_schema`` above documents. Rather than relying on the
-    model to always match the schema, normalize the known equivalent flat
-    shape here so a well-formed ``document_id`` isn't discarded over an
-    outer-structure mismatch. Does not change behavior when ``refs`` is
-    already a non-empty list.
-    """
-    refs = args.get("refs")
-    if isinstance(refs, list) and refs:
-        return refs
-
-    document_id = str(args.get("document_id") or "").strip()
-    if not document_id:
-        return []
-
-    normalized: list[dict[str, Any]] = []
-    section_path = args.get("section_path")
-    if isinstance(section_path, str) and section_path.strip():
-        normalized.append({"document_id": document_id, "section_path": section_path.strip()})
-    for path in args.get("section_paths") or []:
-        if isinstance(path, str) and path.strip():
-            normalized.append({"document_id": document_id, "section_path": path.strip()})
-    chunk_id = args.get("chunk_id")
-    if isinstance(chunk_id, str) and chunk_id.strip():
-        normalized.append({"document_id": document_id, "chunk_id": chunk_id.strip()})
-    for cid in args.get("chunk_ids") or []:
-        if isinstance(cid, str) and cid.strip():
-            normalized.append({"document_id": document_id, "chunk_id": cid.strip()})
-    return normalized
-
-
 @register_tool(
     name="corpus.read",
     description=(
@@ -279,7 +243,9 @@ def _normalize_read_refs(args: dict[str, Any]) -> list[Any]:
         "large tables as row/column headers plus a pointer to "
         "corpus.query_table), and converts asset/page_assets references to "
         "URLs. Use after outline/node_filter/recall/grep have located where "
-        "to look."
+        "to look. Each ref's outcome (ok, or failed with a reason) is "
+        "reported separately — decide pick/no-pick for each ref right "
+        "after seeing its status; a failed ref defaults to not picked."
     ),
     json_schema={
         "type": "object",
@@ -294,6 +260,7 @@ def _normalize_read_refs(args: dict[str, Any]) -> list[Any]:
                         "chunk_id": {"type": "string"},
                     },
                     "required": ["document_id"],
+                    "additionalProperties": False,
                 },
                 "minItems": 1,
                 "description": "Each ref needs document_id and either section_path or chunk_id.",
@@ -311,12 +278,13 @@ def _normalize_read_refs(args: dict[str, Any]) -> list[Any]:
             "resolve_same_as": {"type": "boolean", "default": True},
         },
         "required": ["refs"],
+        "additionalProperties": False,
     },
 )
 async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-    refs = _normalize_read_refs(args)
-    if not refs:
-        return ToolResult(text="", error="read requires refs")
+    refs = args.get("refs")
+    if not isinstance(refs, list) or not refs:
+        return ToolResult(text="", error="read requires a non-empty refs list")
     mode = str(args.get("mode") or "self").strip().lower()
     if mode not in ("self", "descendants"):
         return ToolResult(text="", error=f"unsupported mode: {mode}")
@@ -353,13 +321,29 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         )
         job_id_by_revision = {str(rid): str(jid) for rid, jid in job_rows.all() if rid and jid}
 
+    # One entry per input ref (by index), in call order — the per-ref
+    # ok/failed signal this tool now surfaces instead of a single joined
+    # error string. "pending" entries are finalized once section_job refs'
+    # matched chunks are known, below.
+    ref_status: list[dict[str, Any]] = [
+        {
+            "document_id": str(ref.get("document_id") or "").strip(),
+            "section_path": str(ref.get("section_path") or "").strip() or None,
+            "chunk_id": str(ref.get("chunk_id") or "").strip() or None,
+            "status": "pending",
+            "reason": None,
+            "chunk_ids": [],
+        }
+        for ref in refs
+    ]
+
     emit_items: list[tuple[str, Any]] = []
-    errors: list[str] = []
-    for ref in refs:
+    for index, ref in enumerate(refs):
         document_id = str(ref.get("document_id") or "").strip()
         job_result_id = revision_by_doc.get(document_id)
         if not job_result_id:
-            errors.append(f"unknown document_id: {document_id}")
+            ref_status[index]["status"] = "failed"
+            ref_status[index]["reason"] = f"unknown document_id: {document_id}"
             continue
         chunk_id = str(ref.get("chunk_id") or "").strip()
         section_path = str(ref.get("section_path") or "").strip()
@@ -381,9 +365,12 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 )
             ).first()
             if row is None:
-                errors.append(f"unknown chunk_id: {chunk_id} in {document_id}")
+                ref_status[index]["status"] = "failed"
+                ref_status[index]["reason"] = f"unknown chunk_id: {chunk_id} in {document_id}"
                 continue
             chunk, resolved_section_path = row
+            ref_status[index]["status"] = "ok"
+            ref_status[index]["chunk_ids"] = [chunk.chunk_id]
             emit_items.append(
                 (
                     "chunk_rows",
@@ -407,7 +394,8 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             continue
 
         if not section_path:
-            errors.append(f"ref for {document_id} needs section_path or chunk_id")
+            ref_status[index]["status"] = "failed"
+            ref_status[index]["reason"] = f"ref for {document_id} needs section_path or chunk_id"
             continue
 
         resolved_path, path_error = await resolve_section_path_anchor(
@@ -417,12 +405,14 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             section_path=section_path,
         )
         if path_error or not resolved_path:
-            errors.append(path_error or f"unknown section_path for {document_id}")
+            ref_status[index]["status"] = "failed"
+            ref_status[index]["reason"] = path_error or f"unknown section_path for {document_id}"
             continue
         emit_items.append(
             (
                 "section_job",
                 {
+                    "ref_index": index,
                     "document_id": document_id,
                     "job_result_id": job_result_id,
                     "resolved_path": resolved_path,
@@ -494,6 +484,7 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             base_rows.extend(payload)
             continue
         job = payload
+        ref_index = job["ref_index"]
         matched_ids = {
             section.section_id
             for section in section_matches
@@ -510,9 +501,11 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             for section in section_matches
             if section.section_id in matched_ids
         }
+        job_chunk_ids: list[str] = []
         for chunk in batched_chunks:
             if chunk.section_id not in matched_ids:
                 continue
+            job_chunk_ids.append(chunk.chunk_id)
             base_rows.append(
                 {
                     "document_id": job["document_id"],
@@ -532,11 +525,27 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                     "file_path": chunk.file_path,
                 }
             )
+        if job_chunk_ids:
+            ref_status[ref_index]["status"] = "ok"
+            ref_status[ref_index]["chunk_ids"] = job_chunk_ids
+        else:
+            ref_status[ref_index]["status"] = "failed"
+            ref_status[ref_index]["reason"] = (
+                f"no body chunk found for {job['resolved_path']} in "
+                f"{job['document_id']} (image/table-only or empty section)"
+            )
 
     if not base_rows:
         return ToolResult(
-            text="",
-            error="no chunks resolved for given refs" + (f" ({'; '.join(errors)})" if errors else ""),
+            text="\n".join(
+                f"[{entry['status']}"
+                + (f": {entry['reason']}" if entry["reason"] else "")
+                + f"] document_id={entry['document_id']} "
+                f"section_path={entry['section_path']} chunk_id={entry['chunk_id']}"
+                for entry in ref_status
+            ),
+            payload={"chunks": [], "refs": ref_status},
+            error="no chunks resolved for given refs",
         )
 
     if resolve_same_as_flag:
@@ -592,9 +601,13 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             composed["content"] = _image_display_content(row)
         assembled.append(composed)
 
-    lines = []
-    if errors:
-        lines.append(f"errors: {'; '.join(errors)}")
+    lines = ["refs:"]
+    for entry in ref_status:
+        tag = "[ok]" if entry["status"] == "ok" else f"[failed: {entry['reason']}]"
+        lines.append(
+            f"  {tag} document_id={entry['document_id']} "
+            f"section_path={entry['section_path']} chunk_id={entry['chunk_id']}"
+        )
     for row in assembled:
         lines.append(
             f"### {row.get('source_file_name')} ({row.get('document_id')}) / "
@@ -604,7 +617,7 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 
     return ToolResult(
         text="\n".join(lines),
-        payload={"chunks": assembled, "errors": errors},
+        payload={"chunks": assembled, "refs": ref_status},
         refs=[
             {"document_id": row["document_id"], "chunk_id": row["chunk_id"]}
             for row in assembled

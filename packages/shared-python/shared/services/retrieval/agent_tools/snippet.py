@@ -1,9 +1,16 @@
-"""Shared hit rendering for ``corpus.grep`` and ``corpus.recall``.
+"""Shared hit rendering for every ``corpus.*`` tool.
 
 ``build_snippet`` windows body text around the first match: head + first-match
 window + tail, ``...``-joined, overlap-merged. Only the first match is
-windowed. ``format_search_hit_line`` renders the model-visible identifier
-line so both tools stay on the same shape.
+windowed.
+
+``format_row`` renders the one model-visible row shape every tool shares —
+outline/node_filter (map rows: indented, ``summary``, ``chunk_count``),
+grep/recall (hit rows: flat, ``snippet``, ``score``), and assets (asset rows:
+``chunk_id`` plus the hosting ``section_path``) all call this instead of
+building their own line format, so a model reads one row shape regardless of
+which tool produced it and copies the same fields (``document_id`` +
+``section_path``/``chunk_id``) into ``corpus.read``.
 """
 
 from __future__ import annotations
@@ -65,31 +72,48 @@ def build_snippet(
     return "".join(parts)
 
 
-def format_search_hit_line(
+def format_row(
     *,
-    source_file_name: object,
+    kind: str,
     document_id: object,
     section_path: object,
-    snippet: str,
-    chunk_type: object,
+    title: object = "",
     chunk_id: object | None = None,
+    chunk_count: int | None = None,
+    summary: str = "",
+    snippet: str = "",
     score: object | None = None,
+    depth: int = 0,
+    is_hit: bool = False,
 ) -> str:
-    """Render one grep/recall hit with the fields the model can copy into read.
+    """Render one row. Every ``corpus.*`` search/map tool shares this shape.
 
-    Body hits keep ``document_id`` + ``section_path``. Image/table hits also
-    include ``chunk_id`` because their stored ``section_path`` is the document
-    Root, not the host section.
+    ``kind`` is ``section`` (outline/node_filter node), ``text``/``page``
+    (body hit), or ``image``/``table`` (asset — its own body chunk or a hit
+    on one). ``chunk_id`` is included for ``image``/``table`` rows (their
+    stored ``section_path`` is the document Root — this field then names the
+    *hosting* section instead, or stays ``Root`` when no host was found).
+    ``chunk_count``/``summary`` are map-row fields; ``snippet``/``score`` are
+    hit-row fields; ``depth`` indents a map row under its parent; ``is_hit``
+    marks a row lit up by node_filter/lighting scoring.
     """
-    type_label = str(chunk_type or "").strip()
-    score_part = f" score={score}" if score is not None else ""
-    snippet_part = f": {snippet!r}" if snippet else ""
+    indent = "  " * max(depth, 0)
+    label = str(title or "").strip()
+    header = f"{indent}- [{kind}]"
+    if label:
+        header += f" {label}"
+    header += f" | document_id={document_id} section_path={section_path}"
     if chunk_id:
-        return (
-            f"- [{type_label}] {source_file_name} ({document_id}) "
-            f"chunk_id={chunk_id} / {section_path}{score_part}{snippet_part}"
-        )
-    return (
-        f"- [{type_label}] {source_file_name} ({document_id}) / "
-        f"{section_path}{score_part}{snippet_part}"
-    )
+        header += f" chunk_id={chunk_id}"
+    if chunk_count is not None:
+        header += f" (chunks={chunk_count})"
+    if score is not None:
+        header += f" score={score}"
+    if is_hit:
+        header += " [Hit]"
+    lines = [header]
+    if summary:
+        lines.append(f"{indent}  summary: {summary}")
+    if snippet:
+        lines.append(f"{indent}  snippet: {snippet!r}")
+    return "\n".join(lines)

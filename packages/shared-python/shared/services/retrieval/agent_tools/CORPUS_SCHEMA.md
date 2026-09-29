@@ -130,20 +130,80 @@ for anything finer-grained than a document pair.
   (`path_content`: persisted map-unit BM25 over path+content; `term`:
   substring match over `document_map_units.term_search_text_lower`) via RRF.
 
-## 6. Tools and when to use each
+## 6. Tools and how they work together
 
-| Tool | Use when | Scope | Notes |
-|---|---|---|---|
-| `list_documents` | The user explicitly asks to list or inventory the corpus's documents | namespace | Returns every document's keywords/summary/type mix/`parse_track`. Do not use as a question-answering cold start. |
-| `outline` | The task only needs titles/summaries — overview, "what does chapter N cover," picking where to look before reading | one document, or a `section_path` prefix within it | Titles + summaries + `chunk_count`, no body text, no folding. Each line also prints the full `section_path` — copy that value into `read`, not the title alone. Depth-limited by argument, not by a token budget. |
-| `node_filter` | The task is a traversal/exclusion predicate — FOR ALL / EXISTS / ANY / NOT — over section titles or summaries ("which docs mention X in a heading," "sections NOT about Y") | one or more documents | Call args are `document_ids` + a `predicates` array; each predicate is `{field: "path"|"summary", terms: [...], match: "substring"|"regex"}` — `field` picks section-path vs. summary matching (not body text). Predicates AND together across the array; `terms` within one predicate OR together. Returns the full matching set and count, never a truncated top-K. If the predicate must run against body text, use `grep` instead. |
-| `grep` | Exact string / identifier / number lookup against published `term_search_text` (body text, image descriptions, table summaries/keywords, plus filename and section path) | scoped by document/section/chunk_type | Call args are `pattern` (one term) and/or `patterns` (a list of terms OR'd together) — pass every candidate term/synonym you want to check in one call's `patterns` list rather than issuing several parallel `corpus.grep` calls in the same turn. Returns match count plus snippets. Table and image hits include rendered content; body hits include any connected table or image. Each hit includes `chunk_type` and `document_id`. Body hits (`text`/`page`) also include `section_path` for `read`. `image`/`table` hits also include `chunk_id` — their `section_path` is the document Root, not the host section; `read` those with `chunk_id`, or use `assets` `host_of` to find the host. Grep does not scan table-cell HTML. `document_ids` only narrows the search scope. Never pass `file_path` as `chunk_id`. |
-| `recall` | A fuzzy question where you don't know where the answer lives | namespace or scoped | Ranked candidates from `path_content` (BM25) + `term` (substring) channels fused by RRF; `vector` is reserved — see §5. Table and image hits include rendered content; body hits include any connected table or image. Each hit includes `chunk_type` and `document_id`. Body hits include `section_path` for `read`. `image`/`table` hits include `chunk_id` — their `section_path` is the document Root, not the host section; `read` those with `chunk_id`, or use `assets` `host_of`. |
-| `read` | You already know which section(s)/chunk(s) to read | one or more sections/chunks | Returns full body content, resolves `SAME-AS` markers into the owner's text, expands `connect_to` assets, and converts `page_assets` / image `file_path` into URLs. Small tables (`< 50` rows and `< 50` columns, and under the observation character budget) return their full HTML. Large tables do not: `read` says the table is too large and lists every row/column header — use `query_table` to select specific cells. If your `section_path` omits ancestor segments (e.g. missing a top-level volume like `附件目录 /`), `read` tries a unique suffix match within the document; if several sections match, it returns an ambiguity error listing the full paths — copy the full path from `outline`/`grep`/`refs` when that happens. |
-| `query_table` | `read` said a table is too large and you need selected cells | one table chunk | One read-only `SELECT` against that chunk's grid. Requires `document_id`, `chunk_id`, and `sql`. The SQL table name is `t`; columns are `row_header` plus the table's column headers. Writes, `ATTACH`, and multiple statements are rejected. A missing `LIMIT` is set to 50. Small tables can be queried too, but `read` should show those in full first. |
-| `assets` | You need images/tables directly, or need to find which section(s) host a given asset | one or more documents | Forward (by type/query) and reverse (asset → hosting section) lookup — see §3. Forward lines include `document_id`, `chunk_id`, `file_path`, and the asset's own `section_path` (Root). Addresses only — open the body with `read` (and `query_table` for a large table). `read` an asset with `chunk_id`, not `file_path`. |
-| `neighbors` | You need related documents in the same namespace | one document | Document-level `related` edges only — see §4. |
+Every tool exists to find the `section_path`s (or asset `chunk_id`s) that
+answer the query, then hand them to `read`. Exact call parameters live only
+in each tool's own schema/description (ask for that, do not memorize names
+here) — this section is the collaboration map: which tools narrow a search
+space, which produce hits, and what to do with either kind of result.
 
-General rule: prefer `outline` / `node_filter` to locate before `read`ing
-body text; prefer `grep` over `recall` when you know the exact string you
-are looking for; only fall back to `recall` for genuinely fuzzy questions.
+```mermaid
+flowchart LR
+    subgraph MapNarrowing["Narrow a map (overview / structural predicate)"]
+        outline
+        node_filter
+    end
+    subgraph LeafHits["Find hits (exact string / fuzzy / asset listing)"]
+        grep
+        recall
+        assets
+    end
+    outline -->|narrows scope for| LeafHits
+    node_filter -->|narrows scope for| LeafHits
+    MapNarrowing -->|section_path| finish
+    MapNarrowing -->|section_path| read
+    LeafHits -->|section_path or chunk_id| read
+    read -->|table too large| query_table
+    read --> finish
+    query_table --> finish
+    list_documents["list_documents (namespace inventory, standalone)"]
+    neighbors["neighbors (related documents, standalone)"]
+```
+
+**`outline` and `node_filter`** are the two map-narrowing tools: both take
+one or more scope targets (a whole document, or a section and everything
+under it) and return the *same* row shape — every `section_path` in that
+scope, indented by level, with title/summary. `outline` returns that
+unconditionally (the outline of what is there); `node_filter` returns it
+only for the branches around a structural predicate match (marked as a
+hit), still shown as full context (ancestors + the entire matched subtree),
+not a bare list of matches. Either one's result is a legitimate final
+answer on its own — cite a `section_path` from it directly via `finish` — or
+a starting point to `read` a specific branch, or a scope to hand to a
+leaf-hit tool below. Neither is callable on a single leaf section with
+nothing under it; `read` that directly instead.
+
+**`grep`, `recall`, and `assets`** are the leaf-hit tools: they search
+*within* a scope (the whole corpus, or one narrowed by a prior
+`outline`/`node_filter` call) and return rows pointing at specific
+sections/chunks, not a map. `grep` is exact-string; `recall` is fuzzy
+ranked search; `assets` lists image/table chunks by type — on its own it is
+an unfiltered listing with no way to judge relevance, so pair it with a
+prior `grep`/`recall` hit (scope to that hit's section, or reverse-resolve
+the hit's own asset references) rather than browsing every asset in a
+document. Grep does not scan table-cell HTML — a table only surfaces from
+`grep`/`recall` via its published summary/keywords/caption, never by a
+literal cell value; find the table via `assets` (or a `grep`/`recall` hit on
+the surrounding body text) and use `read`/`query_table` to inspect its
+cells. Every hit row names a `document_id` plus either a `section_path`
+(body hits) or a `chunk_id` (image/table hits, whose stored `section_path`
+is always the document root, not where they visually belong) — read
+whichever one applies with `read` next, then decide pick or no-pick for
+that ref immediately from `read`'s own per-ref status.
+
+**`read`** is where body content actually gets consumed: it accepts many
+refs at once (mixing map-tool section_paths and leaf-hit chunk_ids), and
+reports each ref's outcome separately so a failed ref does not hide a
+successful one. A table `read` reports as too large points at
+**`query_table`** for cell-level `SELECT`s over that same table.
+
+**`list_documents`** and **`neighbors`** stand outside this flow:
+`list_documents` is a namespace-wide inventory (only for an explicit
+"list/inventory the documents" request, never a cold-start for a content
+question); `neighbors` returns document-level related edges (§4), unscoped
+by section.
+
+General rule: narrow with `outline`/`node_filter` before searching a large
+corpus; prefer `grep` over `recall` when you know the exact string you are
+looking for, and fall back to `recall` only for genuinely fuzzy questions.

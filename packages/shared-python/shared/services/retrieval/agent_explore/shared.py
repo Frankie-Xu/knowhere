@@ -18,8 +18,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import jsonschema
+import jsonschema.validators
+
 from shared.services.retrieval.agent_explore.budget import EpisodeBudget
+from shared.services.retrieval.agent_explore.config import FINISH_TOOL_SCHEMA
 from shared.services.retrieval.agent_tools import ToolResult
+from shared.services.retrieval.agent_tools.registry import MAP_TOOL_CHAR_BUDGET
 
 # Tools whose ToolResult.refs point at evidence the agent has actually looked
 # at (full body content), as opposed to candidate/listing refs from
@@ -29,6 +34,18 @@ from shared.services.retrieval.agent_tools import ToolResult
 EVIDENCE_TOOL_NAMES = frozenset(
     {"corpus.read", "corpus.assets", "corpus.query_table"}
 )
+
+# The two map-narrowing tools self-bound their own rendered text at
+# MAP_TOOL_CHAR_BUDGET via score-based folding (never mid-text truncation —
+# see scoring.map_lighting) instead of relying on tool_message_content's
+# generic cap. char_budget_for_tool below is what lets a harness apply that
+# larger budget only to these two tool names.
+MAP_TOOL_NAMES = frozenset({"corpus.outline", "corpus.node_filter"})
+
+
+def char_budget_for_tool(tool_name: str, budget_max_chars: int) -> int:
+    """``MAP_TOOL_CHAR_BUDGET`` for outline/node_filter, else the caller's own cap."""
+    return MAP_TOOL_CHAR_BUDGET if tool_name in MAP_TOOL_NAMES else budget_max_chars
 
 
 def model_accepts_images(model: str) -> bool:
@@ -110,7 +127,7 @@ def tool_message_content(result: ToolResult, *, max_chars: int) -> str:
     return (
         text[:max_chars]
         + f"\n...[truncated, {omitted} more chars — narrow the scope "
-        "(e.g. depth/path_prefix for outline, a tighter predicate for "
+        "(a tighter scope/depth for outline, a tighter predicate for "
         "node_filter, or a more specific ref for read) and call again if "
         "you need the rest]"
     )
@@ -162,6 +179,27 @@ def select_episode_refs(
         agent_selected_refs=list(finish_refs),
         fallback_refs=[],
     )
+
+
+def validate_finish_args(args: dict[str, Any]) -> str | None:
+    """Validate ``finish``'s own args against ``FINISH_TOOL_SCHEMA``; ``None`` = valid.
+
+    Both harnesses route ``finish`` argument validation through this one
+    function instead of relying solely on the provider enforcing the closed
+    schema at generation time — whether either provider actually does that
+    is unverified (see ``config.py``'s ``FINISH_TOOL_SCHEMA`` docstring
+    context), so this is the real enforcement point.
+    """
+    if not isinstance(args, dict):
+        return f"finish: arguments must be a JSON object, got {type(args).__name__}"
+    validator_cls = jsonschema.validators.validator_for(FINISH_TOOL_SCHEMA)
+    validator = validator_cls(FINISH_TOOL_SCHEMA)
+    errors = sorted(
+        validator.iter_errors(args), key=lambda error: [str(p) for p in error.path]
+    )
+    if not errors:
+        return None
+    return f"finish: invalid arguments: {errors[0].message}"
 
 
 def finish_refs_from_args(args: dict[str, Any] | None) -> list[dict[str, Any]] | None:

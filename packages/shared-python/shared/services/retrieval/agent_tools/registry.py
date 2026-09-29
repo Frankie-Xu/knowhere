@@ -18,12 +18,20 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
+import jsonschema
+import jsonschema.validators
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.services.retrieval.document_scope import DocumentScope
 from shared.services.retrieval.settings import EVIDENCE_TEXT_CHAR_BUDGET
 
 DbFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+
+# Char budget for the two map tools (``corpus.outline``, ``corpus.node_filter``)
+# once they self-bound via lighting instead of a hard mid-text cut — see
+# ``scoring/map_lighting.py`` and each harness's ``tool_message_content`` call.
+# Every other tool still uses ``EVIDENCE_TEXT_CHAR_BUDGET`` below.
+MAP_TOOL_CHAR_BUDGET = 20_000
 
 
 @dataclass(frozen=True)
@@ -33,7 +41,7 @@ class ToolBudget:
     ``max_items`` is a hard ceiling on how many rows a tool that returns an
     unbounded/ranked list (``recall``, ``grep``, asset forward search) may
     return in one call: each such tool keeps its own smaller, tool-appropriate
-    default (e.g. ``grep``'s ``max_results``, ``recall``'s ``top_k``) but
+    default (both ``grep`` and ``recall`` call this argument ``limit``) but
     clamps the caller-requested value to this ceiling via ``capped_limit()``
     below, and notes it in ``ToolResult.text`` when the request was clamped.
     Tools that promise a complete, non-truncated set by contract
@@ -67,6 +75,15 @@ class ToolContext:
     db_factory: DbFactory
     budget: ToolBudget = field(default_factory=ToolBudget)
     document_scope: DocumentScope = DocumentScope()
+    # The end user's original query for this episode, when the caller is
+    # ``agent_explore`` (``dispatch.dispatch_tool_call`` threads it through
+    # from ``run_episode``). Used only by ``corpus.outline``/``corpus.node_filter``
+    # to score and fold an oversized map (``scoring/map_lighting.py``) — never
+    # by hit tools, which already take their own ``query``/``pattern``.
+    # Empty when a caller (e.g. an external MCP client hitting a single
+    # ``corpus.*`` tool directly) has no such query: lighting then fails
+    # that one call with a "narrow scope" error instead of guessing.
+    query: str = ""
 
 
 @dataclass
@@ -123,7 +140,67 @@ class ToolRegistry:
         spec = self.get(name)
         if spec is None:
             return ToolResult(text="", error=f"unknown tool: {name}")
+        schema_error = validate_tool_args(spec, args)
+        if schema_error is not None:
+            return ToolResult(text="", error=schema_error)
         return await spec.run(ctx, args)
+
+
+def _describe_error_path(path: Any) -> str:
+    parts: list[str] = []
+    for part in path:
+        if isinstance(part, int):
+            parts.append(f"[{part}]")
+        else:
+            parts.append(f".{part}" if parts else str(part))
+    return "".join(parts) or "<top level>"
+
+
+def validate_tool_args(spec: ToolSpec, args: dict[str, Any]) -> str | None:
+    """Validate ``args`` against ``spec.json_schema``; ``None`` means valid.
+
+    Every tool schema declares ``additionalProperties: false`` at every
+    object level (registered tools are expected to keep this true — see
+    ``CORPUS_SCHEMA.md`` §6), so an unknown key anywhere in the argument
+    tree fails here instead of being silently dropped or ignored downstream.
+    The returned message names the offending path, the tool's legal
+    top-level argument names, and — for an unknown-key error — the exact
+    legal names at that nesting level, so the caller can retry correctly
+    without re-reading the full schema.
+    """
+    if not isinstance(args, dict):
+        return f"{spec.name}: arguments must be a JSON object, got {type(args).__name__}"
+
+    validator_cls = jsonschema.validators.validator_for(spec.json_schema)
+    validator = validator_cls(spec.json_schema)
+    errors = sorted(
+        validator.iter_errors(args), key=lambda error: [str(p) for p in error.path]
+    )
+    if not errors:
+        return None
+
+    error = errors[0]
+    path = _describe_error_path(error.path)
+    top_level_args = sorted((spec.json_schema.get("properties") or {}).keys())
+
+    if error.validator == "additionalProperties":
+        instance = error.instance if isinstance(error.instance, dict) else {}
+        schema_here = error.schema if isinstance(error.schema, dict) else {}
+        legal_here = sorted((schema_here.get("properties") or {}).keys())
+        extra = sorted(set(instance) - set(legal_here))
+        return (
+            f"{spec.name}: unknown argument(s) {extra} at {path} — this "
+            f"object only accepts: {legal_here}. Retry with only those names."
+        )
+    if error.validator == "required":
+        return (
+            f"{spec.name}: {error.message} at {path}. "
+            f"Top-level arguments: {top_level_args}."
+        )
+    return (
+        f"{spec.name}: invalid argument at {path}: {error.message}. "
+        f"Top-level arguments: {top_level_args}."
+    )
 
 
 REGISTRY = ToolRegistry()

@@ -6,9 +6,20 @@ fusion in retrieval):
 
 - ``path_content``: reuses ``search.map_unit_discovery.map_unit_discovery``
   (persisted map-unit BM25 over path+content, already RRF-fused internally).
+  A ``scope`` section-subtree restriction is applied *after* that call, over
+  a pool of up to ``budget.max_items`` candidates, not as a SQL predicate
+  inside ``map_unit_discovery`` itself — that shared function backs every
+  classic-retrieval caller in the platform and carries delicate index-
+  completeness invariants tied to its existing scope/signal-path branches;
+  adding a new SQL clause there was judged a materially bigger, riskier
+  change than this tool warrants. In the rare case where a scoped subtree's
+  true best matches fall outside that pool, this channel under-returns
+  rather than missing scope — disclosed here, not silent.
 - ``term``: a fresh substring channel over
   ``document_map_units.term_search_text_lower`` — this column is persisted at
-  index time and is ranked here as an independent substring channel.
+  index time and is ranked here as an independent substring channel. A
+  ``scope`` restriction here *is* a SQL predicate (this channel's own query,
+  not the shared one above), so it is exact.
 
 ``vector`` is accepted in ``channels`` but rejected as reserved/not
 implemented (``CORPUS_SCHEMA.md`` §5) — it is not silently ignored.
@@ -22,12 +33,13 @@ in code — only path=1.0/content=2.0 survive in ``scoring.knowhere_hybrid``).
 The term channel's snippet and the rendered ``text`` preview both go through
 the shared ``agent_tools.snippet.build_snippet`` (head + first-match window +
 tail, ``...``-joined, overlap-merged) — the same mechanism ``corpus.grep``
-uses, so window-slicing constants live in one place.
+uses, so window-slicing constants live in one place. Rows render through the
+shared ``agent_tools.snippet.format_row`` — the same row shape
+``corpus.outline``/``corpus.node_filter``/``corpus.grep``/``corpus.assets``
+use.
 """
 
 from __future__ import annotations
-
-from shared.services.retrieval.document_scope import DocumentScope
 
 from typing import Any
 
@@ -42,10 +54,15 @@ from shared.services.retrieval.agent_tools.registry import (
     capped_limit,
     register_tool,
 )
-from shared.services.retrieval.agent_tools.snippet import (
-    build_snippet,
-    format_search_hit_line,
+from shared.services.retrieval.agent_tools.scope import (
+    SCOPE_SCHEMA,
+    ScopeTarget,
+    resolve_scope,
+    scope_document_ids,
+    scope_sql_clause,
 )
+from shared.services.retrieval.agent_tools.snippet import build_snippet, format_row
+from shared.services.retrieval.document_scope import DocumentScope
 from shared.services.retrieval.hydration.row_utils import normalize_chunk_type
 from shared.services.retrieval.settings import ASSET_CHUNK_TYPES
 from shared.services.retrieval.search.map_unit_discovery import map_unit_discovery
@@ -53,7 +70,7 @@ from shared.services.retrieval.search.scoring import merge_channels_rrf
 
 _SUPPORTED_CHANNELS = {"path_content", "term"}
 _RESERVED_CHANNELS = {"vector"}
-_DEFAULT_TOP_K = 10
+_DEFAULT_LIMIT = 10
 
 _TERM_CHANNEL_SQL = """
 SELECT dmu.document_id, dmu.job_result_id, dmu.section_id, ds.section_path,
@@ -68,10 +85,26 @@ WHERE d.user_id = :user_id
     AND d.namespace = :namespace
     AND d.status = 'active'
     {doc_clause}
+    {scope_clause}
     AND dmu.term_search_text_lower LIKE :like_pattern
 ORDER BY POSITION(:needle IN dmu.term_search_text_lower) ASC
 LIMIT :limit
 """
+
+
+def _in_scope(scope: list[ScopeTarget], *, document_id: str, section_path: str) -> bool:
+    if not scope:
+        return True
+    for target in scope:
+        if target.document_id != document_id:
+            continue
+        if target.section_path is None:
+            return True
+        if section_path == target.section_path or section_path.startswith(
+            f"{target.section_path} / "
+        ):
+            return True
+    return False
 
 
 async def _term_channel_rows(
@@ -81,8 +114,9 @@ async def _term_channel_rows(
     namespace: str,
     query: str,
     document_scope: DocumentScope,
+    scope: list[ScopeTarget],
     chunk_types: set[str] | None,
-    top_k: int,
+    limit: int,
 ) -> list[dict[str, Any]]:
     needle = query.strip().lower()
     if not needle:
@@ -92,11 +126,23 @@ async def _term_channel_rows(
         "namespace": namespace,
         "like_pattern": f"%{needle}%",
         "needle": needle,
-        "limit": top_k,
+        "limit": limit,
     }
-    doc_clause, scope_params = document_scope.sql()
-    params.update(scope_params)
-    statement = text(_TERM_CHANNEL_SQL.format(doc_clause=doc_clause))
+    doc_clause, doc_scope_params = document_scope.sql()
+    params.update(doc_scope_params)
+    scope_clause = ""
+    if scope:
+        clause_text, scope_params = scope_sql_clause(
+            scope,
+            document_column="dmu.document_id",
+            section_path_column="ds.section_path",
+            param_prefix="recall_scope",
+        )
+        scope_clause = f"AND {clause_text}"
+        params.update(scope_params)
+    statement = text(
+        _TERM_CHANNEL_SQL.format(doc_clause=doc_clause, scope_clause=scope_clause)
+    )
     unit_rows = [dict(row._mapping) for row in (await db.execute(statement, params)).all()]
     if not unit_rows:
         return []
@@ -167,15 +213,15 @@ def _identifier_snippet(row: dict[str, Any]) -> str:
         "where the answer lives. Fuses a path+content BM25 channel with a "
         "term substring channel via RRF. Returns candidates with chunk_type, "
         "document_id, path and snippet. Table and image hits include rendered "
-        "content; body hits include any connected table or image. Image/table "
-        "hits also include chunk_id. Call corpus.read using document_id plus "
-        "section_path or chunk_id, not the filename."
+        "content; body hits include any connected table or image. Read the "
+        "candidate's document_id + section_path (or chunk_id, for image/table "
+        "hits) with corpus.read next, not the filename."
     ),
     json_schema={
         "type": "object",
         "properties": {
             "query": {"type": "string"},
-            "document_ids": {"type": "array", "items": {"type": "string"}},
+            "scope": SCOPE_SCHEMA,
             "chunk_types": {"type": "array", "items": {"type": "string"}},
             "channels": {
                 "type": "array",
@@ -186,20 +232,18 @@ def _identifier_snippet(row: dict[str, Any]) -> str:
                 "default": ["path_content", "term"],
                 "description": "'vector' is reserved and not implemented yet.",
             },
-            "top_k": {"type": "integer", "default": _DEFAULT_TOP_K},
+            "limit": {"type": "integer", "default": _DEFAULT_LIMIT},
         },
         "required": ["query"],
+        "additionalProperties": False,
     },
 )
 async def recall(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     query = str(args.get("query") or "").strip()
     if not query:
         return ToolResult(text="", error="recall requires query")
-    requested_top_k = int(args.get("top_k") or _DEFAULT_TOP_K)
-    top_k = capped_limit(requested_top_k, ctx.budget)
-    document_ids = [
-        str(d).strip() for d in (args.get("document_ids") or []) if str(d).strip()
-    ]
+    requested_limit = int(args.get("limit") or _DEFAULT_LIMIT)
+    limit = capped_limit(requested_limit, ctx.budget)
     chunk_types = {
         str(t).strip().lower() for t in (args.get("chunk_types") or []) if str(t).strip()
     } or None
@@ -215,23 +259,52 @@ async def recall(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             error="no runnable channels requested (vector is reserved, not implemented)",
         )
 
-    document_scope = ctx.document_scope.narrow(document_ids) if document_ids else ctx.document_scope
+    scope: list[ScopeTarget] = []
+    if args.get("scope") is not None:
+        scope, scope_error = await resolve_scope(
+            ctx.db,
+            user_id=ctx.user_id,
+            namespace=ctx.namespace,
+            document_scope=ctx.document_scope,
+            raw_scope=args.get("scope"),
+        )
+        if scope_error is not None:
+            return ToolResult(text="", error=f"recall: {scope_error}")
+
+    document_scope = (
+        ctx.document_scope.narrow(scope_document_ids(scope)) if scope else ctx.document_scope
+    )
     channel_rows: list[list[dict[str, Any]]] = []
     weights: list[float] = []
+    scoped_subtree = any(target.section_path is not None for target in scope)
 
     if "path_content" in active_channels:
+        # See module docstring: subtree scoping is a post-filter over a
+        # bounded pool here, not a SQL predicate inside map_unit_discovery.
+        discovery_top_k = ctx.budget.max_items if scoped_subtree else limit
         discovery = await map_unit_discovery(
             ctx.db,
             user_id=ctx.user_id,
             namespace=ctx.namespace,
             query=query,
-            top_k=top_k,
+            top_k=discovery_top_k,
             exclude_document_ids=[],
             document_scope=document_scope,
             exclude_sections=[],
             chunk_types=chunk_types,
         )
-        channel_rows.append(list(discovery.payload.get("fused_rows") or []))
+        rows = list(discovery.payload.get("fused_rows") or [])
+        if scoped_subtree:
+            rows = [
+                row
+                for row in rows
+                if _in_scope(
+                    scope,
+                    document_id=str(row.get("document_id") or ""),
+                    section_path=str(row.get("section_path") or ""),
+                )
+            ][:limit]
+        channel_rows.append(rows)
         weights.append(1.0)
 
     if "term" in active_channels:
@@ -241,13 +314,14 @@ async def recall(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             namespace=ctx.namespace,
             query=query,
             document_scope=document_scope,
+            scope=scope,
             chunk_types=chunk_types,
-            top_k=top_k,
+            limit=limit,
         )
         channel_rows.append(term_rows)
         weights.append(1.0)
 
-    fused = merge_channels_rrf(channel_rows, weights, top_k)
+    fused = merge_channels_rrf(channel_rows, weights, limit)
     media: list[dict[str, str]] = []
     if fused:
         fused, media = await mount_explore_hits(
@@ -269,21 +343,21 @@ async def recall(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         )
     if reserved_requested:
         lines.append(f"note: channels {sorted(reserved_requested)} are reserved, not run")
-    if requested_top_k > top_k:
+    if requested_limit > limit:
         lines.append(f"note: capped to budget.max_items={ctx.budget.max_items}")
     for row in fused:
         snippet = _identifier_snippet(row)
         chunk_type = str(row.get("chunk_type") or "").strip()
         lines.append(
-            format_search_hit_line(
-                source_file_name=row.get("source_file_name"),
+            format_row(
+                kind=chunk_type or "text",
                 document_id=row.get("document_id"),
                 section_path=row.get("section_path"),
-                snippet=snippet,
-                chunk_type=chunk_type,
+                title=row.get("source_file_name"),
                 chunk_id=(
                     row.get("chunk_id") if chunk_type in ASSET_CHUNK_TYPES else None
                 ),
+                snippet=snippet,
                 score=row.get("score"),
             )
         )

@@ -14,7 +14,10 @@ includes rendered table/image content.
 Snippets are built by the shared ``agent_tools.snippet.build_snippet`` (head
 + first-match window + tail, ``...``-joined, overlap-merged) — the same
 mechanism ``corpus.recall``'s term channel uses, so the two tools don't carry
-duplicate window-slicing logic or drift to different constants.
+duplicate window-slicing logic or drift to different constants. Rows render
+through the shared ``agent_tools.snippet.format_row`` — the same row shape
+``corpus.outline``/``corpus.node_filter``/``corpus.recall``/``corpus.assets``
+use, so a model reads one shape regardless of which tool produced it.
 """
 
 from __future__ import annotations
@@ -33,15 +36,12 @@ from shared.services.retrieval.agent_tools.registry import (
     capped_limit,
     register_tool,
 )
-from shared.services.retrieval.agent_tools.snippet import (
-    HIT_CONTEXT_CHARS,
-    build_snippet,
-    format_search_hit_line,
-)
+from shared.services.retrieval.agent_tools.scope import SCOPE_SCHEMA, resolve_scope, scope_orm_clause
+from shared.services.retrieval.agent_tools.snippet import build_snippet, format_row
 from shared.services.retrieval.settings import ASSET_CHUNK_TYPES
 
-_DEFAULT_MAX_RESULTS = 30
-_DEFAULT_CONTEXT_CHARS = HIT_CONTEXT_CHARS
+_DEFAULT_LIMIT = 30
+_DEFAULT_CONTEXT_CHARS = 80
 
 
 def _terms_from_args(args: dict[str, Any]) -> list[str]:
@@ -89,13 +89,16 @@ def _term_search(terms: list[str]) -> tuple[re.Pattern[str], Any]:
         "Exact string search against published term_search_text "
         "(body text, image descriptions, table summaries/keywords, plus "
         "filename and section path). Returns the total number of matching "
-        "chunks plus a capped list of snippets. Table and image hits include "
-        "rendered content; body hits include any connected table or image. "
-        "Provide 'pattern' for one term, or 'patterns' for several candidate "
-        "terms OR'd together in this single call (e.g. synonyms) — issue one "
-        "call with multiple terms instead of several parallel corpus.grep "
-        "calls for different terms in the same turn. At least one of "
-        "pattern/patterns is required."
+        "chunks plus a capped list of snippet rows (score-free — this is an "
+        "exact match, not a ranked search; use corpus.recall for ranking). "
+        "Table and image hits include rendered content; body hits include "
+        "any connected table or image — read the hit's document_id + "
+        "section_path with corpus.read next. Provide 'pattern' for one "
+        "term, or 'patterns' for several candidate terms OR'd together in "
+        "this single call (e.g. synonyms) — issue one call with multiple "
+        "terms instead of several parallel corpus.grep calls for different "
+        "terms in the same turn. At least one of pattern/patterns is "
+        "required."
     ),
     json_schema={
         "type": "object",
@@ -109,15 +112,16 @@ def _term_search(terms: list[str]) -> tuple[re.Pattern[str], Any]:
                 "items": {"type": "string"},
                 "description": "Several search terms OR'd together in this one call.",
             },
-            "document_ids": {"type": "array", "items": {"type": "string"}},
+            "scope": SCOPE_SCHEMA,
             "chunk_types": {"type": "array", "items": {"type": "string"}},
             "context_chars": {"type": "integer", "default": _DEFAULT_CONTEXT_CHARS},
-            "max_results": {"type": "integer", "default": _DEFAULT_MAX_RESULTS},
+            "limit": {"type": "integer", "default": _DEFAULT_LIMIT},
         },
         "anyOf": [
             {"required": ["pattern"]},
             {"required": ["patterns"]},
         ],
+        "additionalProperties": False,
     },
 )
 async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
@@ -125,55 +129,65 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     if not terms:
         return ToolResult(text="", error="grep requires pattern or patterns")
     context_chars = int(args.get("context_chars") or _DEFAULT_CONTEXT_CHARS)
-    requested_max_results = int(args.get("max_results") or _DEFAULT_MAX_RESULTS)
-    max_results = capped_limit(requested_max_results, ctx.budget)
-    document_ids = [
-        str(d).strip() for d in (args.get("document_ids") or []) if str(d).strip()
-    ]
+    requested_limit = int(args.get("limit") or _DEFAULT_LIMIT)
+    limit = capped_limit(requested_limit, ctx.budget)
     chunk_types = {
         str(t).strip().lower() for t in (args.get("chunk_types") or []) if str(t).strip()
     }
 
+    scope_filter = None
+    if args.get("scope") is not None:
+        targets, scope_error = await resolve_scope(
+            ctx.db,
+            user_id=ctx.user_id,
+            namespace=ctx.namespace,
+            document_scope=ctx.document_scope,
+            raw_scope=args.get("scope"),
+        )
+        if scope_error is not None:
+            return ToolResult(text="", error=f"grep: {scope_error}")
+        scope_filter = scope_orm_clause(
+            targets,
+            document_id_col=DocumentChunk.document_id,
+            section_path_col=DocumentSection.section_path,
+        )
+
     compiled, term_filter = _term_search(terms)
     # Match the indexed haystack first so PostgreSQL can use
-    # idx_document_chunks_term_trgm. Joining documents first makes the
-    # planner filter every in-scope chunk and ignore that index.
-    matched = select(
-        DocumentChunk.id,
-        DocumentChunk.chunk_id,
-        DocumentChunk.document_id,
-        DocumentChunk.job_result_id,
-        DocumentChunk.chunk_type,
-        DocumentChunk.term_search_text,
-        DocumentChunk.content,
-        DocumentChunk.file_path,
-        DocumentChunk.chunk_metadata,
-        DocumentChunk.section_id,
-        DocumentChunk.sort_order,
-    ).where(
-        DocumentChunk.term_search_text.is_not(None),
-        term_filter,
-        DocumentChunk.user_id == ctx.user_id,
-        DocumentChunk.namespace == ctx.namespace,
-        ctx.document_scope.predicate(DocumentChunk.document_id),
+    # idx_document_chunks_term_trgm. Section is joined here (not later) so a
+    # scope's section-subtree condition can apply inside this same CTE.
+    matched = (
+        select(
+            DocumentChunk.id,
+            DocumentChunk.chunk_id,
+            DocumentChunk.document_id,
+            DocumentChunk.job_result_id,
+            DocumentChunk.chunk_type,
+            DocumentChunk.term_search_text,
+            DocumentChunk.content,
+            DocumentChunk.file_path,
+            DocumentChunk.chunk_metadata,
+            DocumentChunk.section_id,
+            DocumentChunk.sort_order,
+            DocumentSection.section_path,
+        )
+        .select_from(DocumentChunk)
+        .outerjoin(DocumentSection, DocumentSection.section_id == DocumentChunk.section_id)
+        .where(
+            DocumentChunk.term_search_text.is_not(None),
+            term_filter,
+            DocumentChunk.user_id == ctx.user_id,
+            DocumentChunk.namespace == ctx.namespace,
+            ctx.document_scope.predicate(DocumentChunk.document_id),
+        )
     )
-    if document_ids:
-        matched = matched.where(DocumentChunk.document_id.in_(document_ids))
+    if scope_filter is not None:
+        matched = matched.where(scope_filter)
     if chunk_types:
         matched = matched.where(
             func.lower(DocumentChunk.chunk_type).in_(sorted(chunk_types))
         )
     matched = matched.cte("matched").prefix_with("MATERIALIZED")
-
-    scope_filters = [
-        Document.user_id == ctx.user_id,
-        Document.namespace == ctx.namespace,
-        Document.status == "active",
-        Document.current_job_result_id == matched.c.job_result_id,
-        ctx.document_scope.predicate(Document.document_id),
-    ]
-    if document_ids:
-        scope_filters.append(Document.document_id.in_(document_ids))
 
     rows_stmt = (
         select(
@@ -186,17 +200,21 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             matched.c.chunk_metadata,
             matched.c.job_result_id,
             JobResult.job_id,
-            DocumentSection.section_path,
+            matched.c.section_path,
             Document.source_file_name,
             func.count().over().label("total_matches"),
         )
         .select_from(matched)
         .join(Document, Document.document_id == matched.c.document_id)
-        .outerjoin(DocumentSection, DocumentSection.section_id == matched.c.section_id)
         .outerjoin(JobResult, JobResult.id == Document.current_job_result_id)
-        .where(*scope_filters)
+        .where(
+            Document.user_id == ctx.user_id,
+            Document.namespace == ctx.namespace,
+            Document.status == "active",
+            Document.current_job_result_id == matched.c.job_result_id,
+        )
         .order_by(matched.c.document_id, matched.c.sort_order)
-        .limit(max_results)
+        .limit(limit)
     )
     rows = (await ctx.db.execute(rows_stmt)).all()
     total_matches = int(rows[0][-1]) if rows else 0
@@ -244,18 +262,18 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         )
 
     lines = [f"total_matches={total_matches} returned={len(results)}"]
-    if requested_max_results > max_results:
+    if requested_limit > limit:
         lines.append(f"note: capped to budget.max_items={ctx.budget.max_items}")
     for r in results:
         chunk_type = str(r["chunk_type"] or "").strip()
         lines.append(
-            format_search_hit_line(
-                source_file_name=r["source_file_name"],
+            format_row(
+                kind=chunk_type or "text",
                 document_id=r["document_id"],
                 section_path=r["section_path"],
-                snippet=r["snippet"],
-                chunk_type=chunk_type,
+                title=r["source_file_name"],
                 chunk_id=r["chunk_id"] if chunk_type in ASSET_CHUNK_TYPES else None,
+                snippet=r["snippet"],
             )
         )
         rendered = str(r.get("rendered") or "").strip()

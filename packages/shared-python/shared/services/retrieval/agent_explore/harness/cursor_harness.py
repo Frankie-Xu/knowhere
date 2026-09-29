@@ -84,10 +84,12 @@ from shared.services.retrieval.agent_explore.dispatch import DbFactory, dispatch
 from shared.services.retrieval.agent_explore.shared import (
     EVIDENCE_TOOL_NAMES,
     budget_status_line,
+    char_budget_for_tool,
     cursor_execute_content,
     finish_refs_from_args,
     select_episode_refs,
     tool_message_content,
+    validate_finish_args,
     wire_safe_tool_name,
 )
 from shared.services.retrieval.agent_explore.types import AgentStep, EpisodeResult
@@ -199,6 +201,7 @@ class CursorHarness:
                     namespace=namespace,
                     document_scope=document_scope,
                     budget=tool_budget,
+                    query=query,
                 ),
                 loop,
             )
@@ -207,7 +210,10 @@ class CursorHarness:
             except Exception as exc:  # noqa: BLE001 - one broken tool must not kill the episode
                 tool_result = ToolResult(text="", error=f"{type(exc).__name__}: {exc}")
             elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
-            content = tool_message_content(tool_result, max_chars=tool_budget.max_chars)
+            content = tool_message_content(
+                tool_result,
+                max_chars=char_budget_for_tool(tool_name, tool_budget.max_chars),
+            )
             # Appended per call, unlike openai_harness.py's once-per-turn
             # placement — this harness has no batched-turn concept exposed to
             # the host process (see module docstring): each corpus.* dispatch
@@ -251,6 +257,23 @@ class CursorHarness:
             )
 
         def finish_execute(args: dict[str, Any], _ctx: Any) -> str:
+            args = dict(args or {})
+            validation_error = validate_finish_args(args)
+            if validation_error is not None:
+                with budget_lock:
+                    steps.append(
+                        AgentStep(
+                            step_index=len(steps),
+                            tool_name=FINISH_TOOL_NAME,
+                            tool_args=args,
+                            observation_text=validation_error,
+                            error=validation_error,
+                            elapsed_ms=0,
+                            tokens_used_delta=0,
+                            tokens_used_total=budget.tokens_used,
+                        )
+                    )
+                return json.dumps({"status": "error", "error": validation_error})
             selected = finish_refs_from_args(args)
             cited = selected if selected is not None else []
             notes = str(args.get("notes") or "")
@@ -261,7 +284,7 @@ class CursorHarness:
                     AgentStep(
                         step_index=len(steps),
                         tool_name=FINISH_TOOL_NAME,
-                        tool_args=dict(args or {}),
+                        tool_args=args,
                         observation_text=f"refs={len(cited)} notes={notes!r}",
                         error=None,
                         elapsed_ms=0,

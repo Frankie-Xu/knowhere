@@ -51,6 +51,7 @@ FINISH_TOOL_SCHEMA: dict[str, object] = {
                     "chunk_id": {"type": "string"},
                 },
                 "required": ["document_id"],
+                "additionalProperties": False,
             },
         },
         "notes": {
@@ -62,6 +63,7 @@ FINISH_TOOL_SCHEMA: dict[str, object] = {
         },
     },
     "required": ["refs"],
+    "additionalProperties": False,
 }
 
 FINISH_TOOL_DESCRIPTION = (
