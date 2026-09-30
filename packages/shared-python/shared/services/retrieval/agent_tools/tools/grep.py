@@ -223,6 +223,7 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             matched.c.chunk_metadata,
             matched.c.job_result_id,
             JobResult.job_id,
+            JobResult.document_metadata["result_raw_prefix"].as_string(),
             matched.c.section_path,
             Document.source_file_name,
             func.count().over().label("total_matches"),
@@ -253,6 +254,7 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         chunk_metadata,
         job_result_id,
         job_id,
+        result_raw_prefix,
         section_path,
         source_file_name,
         _total_matches,
@@ -275,6 +277,7 @@ async def grep(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 "chunk_metadata": chunk_metadata or {},
                 "job_result_id": job_result_id,
                 "job_id": job_id,
+                "result_raw_prefix": result_raw_prefix,
             }
         )
 
