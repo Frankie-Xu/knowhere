@@ -65,6 +65,7 @@ class _GrepRows:
                 {"summary": "dose table"},
                 REV_ID,
                 JOB_ID,
+                None,
                 PATH_ROOT,
                 FILE_NAME,
                 1,

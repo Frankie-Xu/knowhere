@@ -350,11 +350,18 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     source_file_name_by_doc = {d.document_id: d.source_file_name or "" for d in documents}
     job_result_ids = sorted(set(revision_by_doc.values()))
     job_id_by_revision: dict[str, str] = {}
+    raw_prefix_by_revision: dict[str, str | None] = {}
     if job_result_ids:
         job_rows = await ctx.db.execute(
-            select(JobResult.id, JobResult.job_id).where(JobResult.id.in_(job_result_ids))
+            select(
+                JobResult.id, JobResult.job_id,
+                JobResult.document_metadata["result_raw_prefix"].as_string(),
+            ).where(JobResult.id.in_(job_result_ids))
         )
-        job_id_by_revision = {str(rid): str(jid) for rid, jid in job_rows.all() if rid and jid}
+        for revision_id, job_id, raw_prefix in job_rows.all():
+            if revision_id and job_id:
+                job_id_by_revision[str(revision_id)] = str(job_id)
+                raw_prefix_by_revision[str(revision_id)] = raw_prefix
 
     # One entry per input ref (by index), in call order — the per-ref
     # ok/failed signal this tool now surfaces instead of a single joined
@@ -414,6 +421,7 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                             "document_id": document_id,
                             "job_result_id": job_result_id,
                             "job_id": job_id,
+                            "result_raw_prefix": raw_prefix_by_revision.get(job_result_id),
                             "source_file_name": source_file_name,
                             "chunk_id": chunk.chunk_id,
                             "section_id": chunk.section_id,
@@ -453,6 +461,7 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                     "resolved_path": resolved_path,
                     "source_file_name": source_file_name,
                     "job_id": job_id,
+                    "result_raw_prefix": raw_prefix_by_revision.get(job_result_id),
                 },
             )
         )
@@ -546,6 +555,7 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                     "document_id": job["document_id"],
                     "job_result_id": job["job_result_id"],
                     "job_id": job["job_id"],
+                    "result_raw_prefix": job.get("result_raw_prefix"),
                     "source_file_name": job["source_file_name"],
                     "chunk_id": chunk.chunk_id,
                     "section_id": chunk.section_id,

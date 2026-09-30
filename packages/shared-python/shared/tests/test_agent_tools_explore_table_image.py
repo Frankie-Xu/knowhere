@@ -745,6 +745,7 @@ class _GrepConnectedRow:
                 },
                 REV_ID,
                 JOB_ID,
+                None,
                 PATH_INTRO,
                 FILE_NAME,
                 1,

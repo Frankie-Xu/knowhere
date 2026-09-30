@@ -68,7 +68,10 @@ async def query_table(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 
     document = (
         await ctx.db.execute(
-            select(Document, JobResult.job_id)
+            select(
+                Document, JobResult.job_id,
+                JobResult.document_metadata["result_raw_prefix"].as_string(),
+            )
             .select_from(Document)
             .outerjoin(JobResult, JobResult.id == Document.current_job_result_id)
             .where(Document.document_id == document_id)
@@ -80,7 +83,7 @@ async def query_table(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     ).first()
     if document is None:
         return ToolResult(text="", error=f"unknown document_id: {document_id}")
-    doc, job_id = document
+    doc, job_id, result_raw_prefix = document
     if not doc.current_job_result_id:
         return ToolResult(text="", error=f"unknown document_id: {document_id}")
 
@@ -107,6 +110,7 @@ async def query_table(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                 "content": chunk.content,
                 "file_path": chunk.file_path,
                 "job_id": job_id,
+                "result_raw_prefix": result_raw_prefix,
             }
         )
     except TableDownloadError as exc:
