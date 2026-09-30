@@ -104,7 +104,7 @@ class CanonicalDemoBundleStore:
                 uploaded_bundle: CanonicalDemoBundle = await asyncio.shield(upload)
             except asyncio.CancelledError:
                 # A thread cannot be cancelled; retain the lease until it stops.
-                await upload
+                await asyncio.gather(upload)
                 raise
             if renewal.done():
                 renewal.result()
@@ -118,7 +118,7 @@ class CanonicalDemoBundleStore:
             try:
                 await asyncio.shield(marker_upload)
             except asyncio.CancelledError:
-                await marker_upload
+                await asyncio.gather(marker_upload)
                 raise
             return uploaded_bundle
         finally:

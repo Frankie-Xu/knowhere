@@ -6,6 +6,8 @@ import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
+from threading import Event
+from typing import Literal
 
 import pytest
 from httpx import AsyncClient
@@ -17,6 +19,94 @@ from tests.support.contract_database import ContractDatabase
 def _write_source(directory: Path, content: str) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "source.md").write_text(content, encoding="utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ("upload", "marker"))
+async def test_cancellation_retains_lease_until_storage_work_finishes(
+    api_client_factory: Callable[[], AbstractAsyncContextManager[AsyncClient]],
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    stage: Literal["upload", "marker"],
+) -> None:
+    async with api_client_factory():
+        from app.services.demo.canonical_bundle import (
+            CanonicalDemoBundleStore,
+            _calculate_content_version,
+            _read_source_signature,
+        )
+        from app.services.demo.canonical_bundle_result import CanonicalDemoBundle
+        from shared.services.redis import RedisServiceFactory
+
+        directory: Path = tmp_path / stage
+        _write_source(directory, "Cancellation must retain the upload lease")
+        source_id: str = f"contract-cancel-{stage}"
+        version: str = _calculate_content_version(
+            directory, _read_source_signature(directory)
+        )
+        lock_key: str = f"lock:demo_bundle:{source_id}:{version}"
+        redis_service = RedisServiceFactory.get_service()
+        store = CanonicalDemoBundleStore(redis_service=redis_service)
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        started: asyncio.Event = asyncio.Event()
+        released: Event = Event()
+        finished: Event = Event()
+        original_upload = store._upload_bundle
+        original_marker = store._write_ready_marker
+
+        def pause_storage() -> None:
+            loop.call_soon_threadsafe(started.set)
+            if not released.wait(timeout=10):
+                raise TimeoutError("Contract did not release paused storage work")
+
+        def upload_bundle(
+            storage_id: str,
+            content_version: str,
+            source_directory: Path,
+            signature: tuple[tuple[str, int, int, int], ...],
+        ) -> CanonicalDemoBundle:
+            pause_storage()
+            try:
+                return original_upload(
+                    storage_id, content_version, source_directory, signature
+                )
+            finally:
+                finished.set()
+
+        def write_marker(bundle: CanonicalDemoBundle) -> None:
+            pause_storage()
+            try:
+                original_marker(bundle)
+            finally:
+                finished.set()
+
+        if stage == "upload":
+            monkeypatch.setattr(store, "_upload_bundle", upload_bundle)
+        else:
+            monkeypatch.setattr(store, "_write_ready_marker", write_marker)
+        request: asyncio.Task[CanonicalDemoBundle] = asyncio.create_task(
+            store.ensure_bundle(source_id=source_id, source_directory=directory)
+        )
+        try:
+            await asyncio.wait_for(started.wait(), timeout=10)
+            owner: object = await redis_service.get(lock_key)
+            assert owner is not None
+            request.cancel()
+            await asyncio.sleep(0)
+            assert not request.done()
+            assert not finished.is_set()
+            assert await redis_service.get(lock_key) == owner
+        finally:
+            released.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, timeout=10)
+
+        assert finished.is_set()
+        assert not await redis_service.exists(lock_key)
+        recovered = await CanonicalDemoBundleStore(
+            redis_service=redis_service
+        ).ensure_bundle(source_id=source_id, source_directory=directory)
+        assert recovered.reused is (stage == "marker")
 
 
 @pytest.mark.asyncio
