@@ -58,7 +58,7 @@ def validate_backup(entry: dict[str, Any], directory: Path) -> Path:
 def request_json(
     client: httpx.Client, method: str, path: str, **arguments: Any
 ) -> dict[str, Any]:
-    response: httpx.Response
+    response: httpx.Response | None = None
     for attempt in range(4):
         try:
             response = client.request(method, path, **arguments)
@@ -67,6 +67,8 @@ def request_json(
             if method != "GET" or attempt == 3:
                 raise
             time.sleep(min(2**attempt, 8))
+    if response is None:
+        raise RuntimeError("API request attempts completed without a response")
     if response.is_error:
         # Never persist response bodies, credentials, storage keys or signed URLs.
         try:
