@@ -130,6 +130,10 @@ that password has already been changed.
 2. Check for reserved private-namespace conflicts and role bypass.
 3. Run additive migrations; confirm the directory is planned with no READY data.
 4. Configure maintainer IDs and runtime credentials; remove strategy settings.
+   Before deploying ECS, add `DEMO_MAINTAINER_USER_IDS` to the environment's
+   runtime secret. Both task definitions require that key. Use a comma-separated
+   list of authorized user IDs, or an empty string to disable demo writes until
+   a maintainer is selected. Adding an API key is not required.
 5. Stop old materialization admission and drain its tasks before updating API and
    Worker together. Old tasks must not execute new publication code.
 6. Verify private upload/retrieval, catalog preparing state and materialization
