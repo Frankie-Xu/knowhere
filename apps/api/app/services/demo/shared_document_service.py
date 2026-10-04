@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import mimetypes
+from pathlib import PurePath
 from typing import Any
 from urllib.parse import quote
 
@@ -99,8 +99,9 @@ class SharedDemoDocumentService:
                 continue
             metadata: dict[str, Any] = revision.document_metadata or {}
             mimeType: str = (
-                mimetypes.guess_type(document.source_file_name or document.title)[0]
-                or "application/octet-stream"
+                JobFileStorage.get_content_type(
+                    PurePath(document.source_file_name or document.title).suffix
+                )
             )
             source: dict[str, Any] = {
                 "demo_source_id": document.demo_source_id,
@@ -206,7 +207,7 @@ class SharedDemoDocumentService:
             )
         if not key:
             raise NotFoundException(resource="Demo original", resource_id=source_id)
-        mimeType: str = mimetypes.guess_type(fileName)[0] or "application/octet-stream"
+        mimeType: str = JobFileStorage.get_content_type(PurePath(fileName).suffix)
         # Redirects let the storage service handle Range without proxying large
         # original files through an API worker. The GET signature overrides MIME.
         return await asyncio.to_thread(
