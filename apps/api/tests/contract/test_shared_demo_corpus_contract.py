@@ -464,15 +464,42 @@ async def test_demo_agent_tools_pin_history_and_private_isolation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file_name", "original_mime"),
+    [
+        ("original.pdf", "application/pdf"),
+        (
+            "original.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            "original.DOCX",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+    ],
+)
 async def test_demo_revision_media_validation_and_job_retention(
-    developer_api_client_factory: ClientFactory, monkeypatch: pytest.MonkeyPatch
+    developer_api_client_factory: ClientFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    file_name: str,
+    original_mime: str,
 ) -> None:
     async with developer_api_client_factory() as client:
         job = await create_demo(
-            client, source_id="media-demo", file_name="original.pdf"
+            client, source_id="media-demo", file_name=file_name
         )
         revision = await publish_demo(job, has_page=True)
+        import mimetypes
+        from pathlib import PurePath
         from shared.services.storage.job_file_storage import JobFileStorage
+
+        # Slim runtime images need not include the operating system MIME registry.
+        mimetypes.init()
+        monkeypatch.delitem(mimetypes.types_map, PurePath(file_name).suffix.lower(), raising=False)
+        catalog = (await client.get("/api/v1/demo/catalog")).json()
+        source = next(item for item in catalog["sources"] if item["demo_source_id"] == "media-demo")
+        assert source["mime_type"] == original_mime
+        assert source["original_file"]["mime_type"] == original_mime
 
         calls: list[dict[str, Any]] = []
 
@@ -487,7 +514,7 @@ async def test_demo_revision_media_validation_and_job_retention(
             JobFileStorage, "storage_adapter", property(lambda self: SignedStorage())
         )
         for path, mime in (
-            ("original", "application/pdf"),
+            ("original", original_mime),
             ("assets/images/rocket.png", "image/png"),
             ("assets/tables/launch.html", "text/html"),
         ):
