@@ -182,6 +182,27 @@ def test_archive_requires_json_and_referenced_assets(payloads, tmp_path):
         validate_parse_result(*payloads)
 
 
+def test_raw_nul_member_name_is_not_hidden_by_zip_normalization(payloads, tmp_path):
+    path = tmp_path / "nul-name.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in zip(("manifest", "chunks", "doc_nav"), payloads):
+            member = "chunks.json!hidden" if name == "chunks" else f"{name}.json"
+            archive.writestr(member, json.dumps(payload))
+        for name in (
+            "images/picture.png", "tables/table.html", "page_citation_assets/page-3.webp"
+        ):
+            archive.writestr(name, b"synthetic asset")
+    path.write_bytes(
+        path.read_bytes().replace(b"chunks.json!hidden", b"chunks.json\0hidden")
+    )
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo("chunks.json")
+        assert "\0" in info.orig_filename and "\0" not in info.filename
+    with pytest.raises(ParseResultContractException) as error:
+        validate_parse_result_archive(str(path), allow_legacy=False)
+    assert error.value.details["violations"][0]["reason"] == "unsafe_member"
+
+
 def test_new_versioned_archive_requires_nav_and_bounded_json(payloads, tmp_path):
     with pytest.raises(ParseResultContractException):
         validate_parse_result_archive(

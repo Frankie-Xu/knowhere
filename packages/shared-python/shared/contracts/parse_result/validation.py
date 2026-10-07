@@ -188,7 +188,8 @@ def validate_parse_result_archive(
             names = [info.filename for info in infos]
             if len(set(names)) != len(names):
                 _fail("ZIP", "members", "duplicate_member")
-            if any(not _safe_member(name) for name in names):
+            # ZipInfo.filename truncates at NUL; validate the original name.
+            if any(not _safe_member(info.orig_filename) for info in infos):
                 _fail("ZIP", "members", "unsafe_member")
             files = {info.filename for info in infos if not info.is_dir()}
             payloads: dict[str, Any] = {}
