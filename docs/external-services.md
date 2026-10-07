@@ -45,7 +45,8 @@ air-gapped deployments.
 
 | Key | Notes |
 | --- | --- |
-| `DATABASE_URL` | SQLAlchemy URL (`postgresql+asyncpg://...`). |
+| `DATABASE_URL` | SQLAlchemy runtime URL (`postgresql+asyncpg://...`). API and worker roles must be `NOSUPERUSER NOBYPASSRLS`. |
+| `MIGRATION_DATABASE_URL` | Separate privileged migration connection; never used for API or worker request sessions. |
 | `DB_SSL_MODE` | `disable`, `allow`, `prefer`, `require`, `verify-ca`, or `verify-full`. |
 | `DB_SSL_CERT` | Optional client certificate path. |
 | `DB_SSL_KEY` | Optional client key path. |
@@ -105,15 +106,15 @@ air-gapped deployments.
 
 | | |
 | --- | --- |
-| **Purpose** | Text and table summarization, heading hierarchy, and other OpenAI-compatible chat calls. README: configure at least one of `DS_KEY`, `ALI_API_KEYS`, `GPT_API_KEY`, or `GLM_API_KEY`. |
-| **Required?** | Required for local startup: **at least one** provider key. URLs and model names have code defaults. |
+| **Purpose** | Text and table summarization, heading hierarchy, and other OpenAI-compatible chat calls. The default text model is `deepseek-v4-flash`. |
+| **Required?** | Configure the provider key for the models you select. The default text and vision models use `DS_KEY`; an alternate provider requires matching model and provider settings. URLs and model names have code defaults. |
 | **Data leaving the box?** | **Yes.** Chunk text, table HTML, and prompts are sent to the provider you enable. |
 
 | Key | Notes |
 | --- | --- |
 | `DS_KEY` | DeepSeek API key. |
 | `DS_URL` | Optional. Default is documented in `.env.example`. |
-| `GPT_API_KEY` | OpenAI API key. |
+| `GPT_API_KEY` | Retained configuration field; the shared client does not select it. Setting this key alone does not configure an OpenAI provider. |
 | `GLM_API_KEY` | Zhipu GLM API key. |
 | `GLM_URL` | Optional GLM base URL. |
 | `ARK_API_KEY` | Volcengine Ark API key. |
@@ -121,25 +122,27 @@ air-gapped deployments.
 | `NORMOL_MODEL` | Optional text-model override (summaries and general LLM calls). |
 | `HIERARCHY_LLM_MODEL` | Optional heading-hierarchy model; falls back to `NORMOL_MODEL`. |
 
-README also lists swapping OpenAI, DashScope, Zhipu, or Volcengine through
-these variables.
+The shared client routes Qwen, GLM, and Ark model names to their respective
+providers. Other model names use `DS_URL` and `DS_KEY` unless the caller
+supplies an explicit API URL and key. For a custom OpenAI-compatible endpoint,
+set `DS_URL`, `DS_KEY`, and a model available at that endpoint.
 
 ---
 
-## Qwen / VLM (DashScope)
+## Vision models (DeepSeek / DashScope)
 
 | | |
 | --- | --- |
-| **Purpose** | Image summaries, OCR, PDF coarse classification, atlas routing, and other vision calls. Default model name in `.env.example` is `qwen3.6-flash`. |
-| **Required?** | Required for image / OCR / atlas / image-aware retrieval. Typical key: `ALI_API_KEYS`. |
-| **Data leaving the box?** | **Yes.** Extracted images and vision prompts are sent to the configured VLM endpoint (DashScope by default). |
+| **Purpose** | Image summaries, OCR, PDF coarse classification, atlas routing, and other vision calls. Default `IMAGE_MODEL` is `deepseek-flash` (DeepSeek-V4.1-Flash). |
+| **Required?** | Required for image / OCR / atlas / V2 Vision Page parsing. The default model uses `DS_KEY` and `DS_URL`. Qwen models use `ALI_API_KEYS` and `ALI_URL` when selected as overrides. |
+| **Data leaving the box?** | **Yes.** Extracted images and vision prompts are sent to the configured VLM endpoint (DeepSeek by default). |
 
 | Key | Notes |
 | --- | --- |
-| `ALI_API_KEYS` | Aliyun DashScope key pool (JSON array, comma/newline list, or `token_id=api_key`). |
-| `ALI_URL` | Optional DashScope-compatible base URL. |
-| `IMAGE_MODEL` | Optional default VLM name. |
-| `IMAGE_MODEL_MAX` | Optional higher-capability VLM name. |
+| `IMAGE_MODEL` | Optional VLM override; default is `deepseek-flash`. |
+| `ASSET_MODEL` | Optional page-memory chart/table bounding-box VLM override. Empty follows `IMAGE_MODEL`. |
+| `ALI_API_KEYS` | Aliyun DashScope key pool for Qwen overrides (JSON array, comma/newline list, or `token_id=api_key`). |
+| `ALI_URL` | Optional DashScope-compatible base URL for Qwen overrides. |
 
 ---
 
@@ -163,9 +166,9 @@ these variables.
 
 | | |
 | --- | --- |
-| **Purpose** | Default PDF parser. Knowhere sends PDFs (or reusable S3 URLs) to MinerU, then rebuilds hierarchy from the Markdown / layout output. |
-| **Required?** | Required for PDF parsing (`MINERU_API_KEYS`). |
-| **Data leaving the box?** | **Yes.** PDF bytes or presigned object URLs go to the MinerU API. |
+| **Purpose** | V1 chunk-track PDF parsing, including PPTX after conversion. Knowhere sends PDFs (or reusable S3 URLs) to MinerU, then rebuilds hierarchy from the Markdown / layout output. V2 PDF/PPTX Vision Page parsing uses vision models instead. |
+| **Required?** | Required for the standard V1 chunk-based PDF/PowerPoint pipeline (`MINERU_API_KEYS`). The V1 atlas route and V2 Vision Page parsing bypass MinerU. |
+| **Data leaving the box?** | **Yes, when MinerU parsing is used.** PDF bytes or presigned object URLs go to the MinerU API. |
 
 | Key | Notes |
 | --- | --- |
@@ -187,9 +190,9 @@ Related local PDF limits in the same `.env.example` files (not vendor keys):
 
 | | |
 | --- | --- |
-| **Purpose** | PPTX → PDF conversion before the PDF / MinerU pipeline. |
-| **Required?** | Required for PPTX parsing. |
-| **Data leaving the box?** | **Yes.** Presentation files are uploaded to iLoveAPI / iLovePDF. |
+| **Purpose** | Optional PPTX → PDF conversion for V1 chunk parsing or V2 Vision Page normalization. |
+| **Required?** | Optional when local LibreOffice is available. Both tracks fall back to LibreOffice when iLoveAPI is unavailable. V1 conversion is followed by MinerU; V2 uses vision models. |
+| **Data leaving the box?** | **Yes, when iLoveAPI is used.** Presentation files are uploaded to iLoveAPI / iLovePDF. LibreOffice conversion is local. |
 
 | Key | Notes |
 | --- | --- |
@@ -263,28 +266,28 @@ analytics. They are not required to parse documents locally.
 | --- | --- |
 | **Purpose** | Deliver async webhooks through Upstash QStash, with signed callbacks into the API. |
 | **Required?** | Required for QStash-backed webhook delivery. |
-| **Data leaving the box?** | **Yes, if enabled.** Webhook payloads go to QStash, then to your public callback URL. |
+| **Data leaving the box?** | **Yes, if enabled.** Webhook payloads go through QStash to the configured webhook endpoint. Delivery-status callbacks return to the API. |
 
 | Key | Notes |
 | --- | --- |
 | `QSTASH_TOKEN` | QStash API token. |
 | `QSTASH_CALLBACK_BASE_URL` | Public API base URL used to build QStash callback paths. |
 | `QSTASH_MAX_RETRIES` | Delivery retry count. |
-| `QSTASH_CURRENT_SIGNING_KEY` | Optional current signing key. |
-| `QSTASH_NEXT_SIGNING_KEY` | Optional next signing key (rotation). |
+| `QSTASH_CURRENT_SIGNING_KEY` | Required for QStash callback signature verification, together with the next signing key. |
+| `QSTASH_NEXT_SIGNING_KEY` | Required for QStash callback signature verification and key rotation, together with the current signing key. |
 | `WEBHOOK_MASTER_KEY` | Local webhook encryption key, not a QStash credential. |
 
-### Moesif
+### Moesif (retained configuration)
 
 | | |
 | --- | --- |
-| **Purpose** | Optional API analytics. |
-| **Required?** | Optional. |
-| **Data leaving the box?** | **Yes, if `MOESIF_APPLICATION_ID` is set.** API request metadata goes to Moesif. |
+| **Purpose** | Retained API analytics configuration; this repository has no active Moesif middleware or outbound analytics client. |
+| **Required?** | Not used by the current runtime. |
+| **Data leaving the box?** | None through a Moesif integration in the current implementation. |
 
 | Key | Notes |
 | --- | --- |
-| `MOESIF_APPLICATION_ID` | Moesif application id. |
+| `MOESIF_APPLICATION_ID` | Retained Moesif application-id setting; setting it alone does not enable analytics. |
 
 ---
 
