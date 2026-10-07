@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
-os.environ.setdefault("TMP_PATH", "/tmp/knowhere-test")
-os.environ.setdefault("S3_BUCKET_NAME", "test-uploads")
-os.environ.setdefault("S3_ACCESS_KEY_ID", "test")
-os.environ.setdefault("S3_SECRET_ACCESS_KEY", "test")
-os.environ.setdefault("S3_TEMP_PATH", "/tmp")
+import base64
+import tempfile
+from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -19,6 +15,7 @@ from shared.services.retrieval.hydration.asset_inline import (
 from shared.services.retrieval.hydration.result_assembly import (
     assemble_retrieval_results,
 )
+from shared.services.storage.result_storage import JobResultStorage
 from shared.services.retrieval.scoring.hierarchy import ProviderToolSpace
 from shared.services.retrieval.scoring.knowhere_provider import (
     KnowhereProvider,
@@ -103,11 +100,17 @@ async def test_assemble_inserts_table_at_placeholder() -> None:
     )
     assert len(assembled) == 1
     content = assembled[0]["content"]
-    assert "[tables/" not in content
-    assert content.index("见表") < content.index("[Table:")
-    assert content.index("[Table:") < content.index("结束")
-    assert "企业入驻信息登记模板" in content
-    assert "SHOULD NOT LEAK" not in content
+    assert "[tables/table-1.html]" in content
+    assert "[Table:" not in content
+    composed_text = "".join(
+        str(part.get("text") or "")
+        for part in assembled[0]["composed"]
+        if part.get("type") == "text"
+    )
+    assert composed_text.index("见表") < composed_text.index("<table")
+    assert composed_text.index("<table") < composed_text.index("结束")
+    assert "SHOULD NOT LEAK" in composed_text
+    assert "[tables/" not in composed_text
 
 
 @pytest.mark.asyncio
@@ -166,13 +169,19 @@ async def test_asset_type_filter_keeps_body_that_connects_to_requested_asset(
     )
 
     assert [row["chunk_id"] for row in assembled] == ["text-1"]
-    assert display_marker in assembled[0]["content"]
-    assert "资产说明" in assembled[0]["content"]
+    assert placeholder in assembled[0]["content"]
+    assert display_marker not in assembled[0]["content"]
 
 
 @pytest.mark.asyncio
-async def test_assemble_inlines_connected_image_without_placeholder() -> None:
-    """#206: connect_to image must be inlined, not dropped from both surfaces."""
+async def test_assemble_skips_connected_image_without_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage_factory = Mock()
+    monkeypatch.setattr(
+        "shared.services.retrieval.hydration.evidence_compose.get_result_storage",
+        storage_factory,
+    )
     rows = [
         {
             "chunk_id": "text-1",
@@ -193,7 +202,7 @@ async def test_assemble_inlines_connected_image_without_placeholder() -> None:
             "chunk_type": "image",
             "content": "Flowchart of the ingestion pipeline.",
             "file_path": "images/flow.png",
-            "asset_url": "https://assets.example.com/job-synth/images/flow.png",
+            "job_id": "job-synth",
         },
     ]
     assembled = await assemble_retrieval_results(
@@ -201,16 +210,33 @@ async def test_assemble_inlines_connected_image_without_placeholder() -> None:
         exclude_document_ids=[],
         exclude_sections=[],
     )
+
     assert [row["chunk_id"] for row in assembled] == ["text-1"]
-    content = assembled[0]["content"]
-    assert "[images/" not in content
-    assert "[Image: https://assets.example.com/job-synth/images/flow.png]" in content
-    assert "Flowchart of the ingestion pipeline." in content
-    assert "The process is illustrated below." in content
+    assert assembled[0]["content"] == rows[0]["content"]
+    assert assembled[0]["composed"] == [
+        {"type": "text", "text": "The process is illustrated below."}
+    ]
+    storage_factory.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_assemble_inserts_image_at_placeholder() -> None:
+async def test_assemble_inserts_image_at_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4"
+        "DwABBAEAX+XDSwAAAABJRU5ErkJggg=="
+    )
+    image_path = tmp_path / "a.png"
+    image_path.write_bytes(image_bytes)
+    storage = Mock(spec=JobResultStorage)
+    storage.normalize_artifact_ref.return_value = "images/a.png"
+    storage.download_raw_to_temp.return_value = str(image_path)
+    monkeypatch.setattr(
+        "shared.services.retrieval.hydration.evidence_compose.get_result_storage",
+        lambda: storage,
+    )
     rows = [
         {
             "chunk_id": "text-1",
@@ -231,6 +257,7 @@ async def test_assemble_inserts_image_at_placeholder() -> None:
             "chunk_type": "image",
             "content": "chart summary",
             "file_path": "images/a.png",
+            "job_id": "job-synth",
         },
     ]
     assembled = await assemble_retrieval_results(
@@ -238,14 +265,25 @@ async def test_assemble_inserts_image_at_placeholder() -> None:
         exclude_document_ids=[],
         exclude_sections=[],
     )
-    assert len(assembled) == 1
-    content = assembled[0]["content"]
-    assert "[images/" not in content
-    assert content.index("see") < content.index("[Image:")
-    assert content.index("[Image:") < content.index("end")
-    assert "[Image: images/a.png]" in content
-    assert "chart summary" in content
-    assert content.count("[Image:") == 1
+
+    assert [row["chunk_id"] for row in assembled] == ["text-1"]
+    assert assembled[0]["content"] == "see [images/a.png] end"
+    assert assembled[0]["composed"] == [
+        {"type": "text", "text": "see \n"},
+        {
+            "type": "image",
+            "media_type": "image/png",
+            "data": base64.b64encode(image_bytes).decode("ascii"),
+        },
+        {"type": "text", "text": "\n"},
+        {"type": "text", "text": " end"},
+    ]
+    storage.download_raw_to_temp.assert_called_once_with(
+        job_id="job-synth",
+        relative_path="images/a.png",
+        suffix=".png",
+        temp_dir=tempfile.gettempdir(),
+    )
 
 
 def test_node_unit_span_inlines_section_assets() -> None:
