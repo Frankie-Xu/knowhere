@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, cast
 from shared.services.retrieval.scoring.knowhere_hybrid import (
     build_content_search_text,
     build_path_search_text,
-    build_term_search_text,
 )
 
 def _children_ids(ts: Any, section_id: str, doc_id: str) -> List[str]:
@@ -95,11 +94,11 @@ def _walk_tree(
     ts: Any,
     doc_id: str,
     root_ids: Sequence[str],
-) -> Tuple[Dict[str, List[str]], Set[str], Dict[str, str]]:
+) -> Tuple[Dict[str, List[str]], List[str], Dict[str, str]]:
     """Return children map, leaf ids, and title map for reachable nodes."""
     children_map: Dict[str, List[str]] = {}
     titles: Dict[str, str] = {}
-    leaves: Set[str] = set()
+    leaves: List[str] = []
     seen: Set[str] = set()
 
     def walk(sid: str) -> None:
@@ -110,7 +109,7 @@ def _walk_tree(
         kids = [c for c in _children_ids(ts, sid, doc_id) if c]
         children_map[sid] = kids
         if not kids:
-            leaves.add(sid)
+            leaves.append(sid)
             return
         for kid in kids:
             walk(kid)
@@ -130,7 +129,9 @@ def build_score_units(
     units: List[dict] = []
     seen_unit_ids: Set[str] = set()
 
-    for leaf_id in sorted(leaves):
+    # Section identifiers are generated per publication. Preserve the provider's
+    # document order so equivalent revisions persist the same sort_order.
+    for leaf_id in leaves:
         content = _section_body_text(ts, leaf_id, doc_id) or (
             titles.get(leaf_id) or _line_content(ts, leaf_id, doc_id)
         )
@@ -151,9 +152,6 @@ def build_score_units(
                     section_path=path_text, section_title=title or content
                 ),
                 "content_search_text": build_content_search_text(content),
-                "term_search_text": build_term_search_text(
-                    content, path_text=path_text
-                ),
             }
         )
 
@@ -180,9 +178,6 @@ def build_score_units(
                     section_path=path_text, section_title=titles.get(sid) or ""
                 ),
                 "content_search_text": build_content_search_text(self_text),
-                "term_search_text": build_term_search_text(
-                    self_text, path_text=path_text
-                ),
             }
         )
     return units

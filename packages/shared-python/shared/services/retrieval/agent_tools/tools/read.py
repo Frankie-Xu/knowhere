@@ -1,14 +1,17 @@
 """``corpus.read`` — full body content for already-located sections/chunks.
 
 Unlike ``hydration.result_assembly.assemble_retrieval_results`` (which
-down-weights ``page`` chunks to their summary — see that module's
-``_page_summary``, a deliberate trade-off for the retrieval-answer surface),
+down-weights ``page`` chunks to their summary — see ``page_summary``, a
+deliberate trade-off for the retrieval-answer surface),
 ``read`` returns the page chunk's full body content, with ``[SAME-AS <owner>
 p<N>]`` markers resolved to the owner section's text (§2 of
 ``CORPUS_SCHEMA.md``) rather than stripped or summarized. ``connect_to``
-assets are still inlined via the same placeholder mechanism as retrieval, and
-``page_assets``/asset ``file_path`` are converted to URLs via the existing
-``enrich_rows_with_retrieval_asset_url``.
+assets are still inlined via the same placeholder mechanism as retrieval.
+Table chunks load the stored HTML: small tables return that HTML; large
+tables return row/column headers only and point at ``corpus.query_table``
+(no window — GREP/recall never scan table-cell HTML, so there is no real
+"hit cell" to center a window on). Image ``file_path`` values are converted
+to URLs before display so a vision harness can attach HTTPS images.
 
 SAME-AS resolution is single-level: the owner chunk's full content is
 embedded as-is. If that owner chunk itself still contains an unrelated
@@ -24,32 +27,38 @@ candidate full paths instead of picking one silently.
 
 from __future__ import annotations
 
+from shared.services.retrieval.corpus_revision_context import CorpusRevisionContext
+
+from shared.services.retrieval.corpus_storage import CorpusStorage
+
 import re
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from shared.models.database.document import (
-    Document,
     DocumentChunk,
     DocumentSection,
 )
 from shared.models.database.job_result import JobResult
 from shared.services.retrieval.agent_tools.registry import (
+    REF_ADDRESS_ONE_OF,
+    REF_ADDRESS_RULE,
     ToolContext,
     ToolResult,
     register_tool,
 )
+from shared.services.retrieval.hydration.asset_inline import inline_assets_at_placeholders
 from shared.services.retrieval.hydration.assets import (
     enrich_rows_with_retrieval_asset_url,
 )
 from shared.services.retrieval.hydration.connected import hydrate_connected_target_rows
-from shared.services.retrieval.hydration.result_assembly import (
-    _compose_table_content,
-    _compose_text_content,
-    _image_display_content,
+from shared.services.retrieval.hydration.result_assembly import _image_display_content
+from shared.services.retrieval.hydration.row_utils import (
+    iter_connected_target_ids,
+    normalize_chunk_type,
 )
-from shared.services.retrieval.hydration.row_utils import normalize_chunk_type
+from shared.services.retrieval.hydration.table_grid import render_explore_table
 from shared.services.retrieval.agent_tools.section_path_lookup import (
     resolve_section_path_anchor,
     section_path_anchor_filter,
@@ -59,14 +68,38 @@ from shared.services.retrieval.search.lexical_text import section_path_from_chun
 
 _SAME_AS_MARKER_RE = re.compile(r"\[SAME-AS (.+?) p(\d+)\]")
 _BODY_CHUNK_TYPES = ("text", "page")
+# Repeated after the ref list and after the body: a long body can be cut by
+# the per-turn text cap, and the ref list alone may scroll out of view.
+_PICK_REMINDER = (
+    "[pick: decide now, for each [ok] ref, whether to cite it in finish; "
+    "[failed] refs cannot be cited]"
+)
 
-# ``_compose_text_content`` doesn't branch on chunk_type — it just inlines
-# connect_to placeholders — so the ``page`` branch below reuses it directly
-# instead of carrying a near-identical copy. The behavioral difference from
-# retrieval's own page handling (never downgrading to a summary — see the
-# module docstring) comes entirely from *not* calling ``_page_summary``
-# first, which this module never did.
 
+def _ref_status_line(entry: dict[str, Any]) -> str:
+    tag = "[ok]" if entry["status"] == "ok" else f"[failed: {entry['reason']}]"
+    return (
+        f"{tag} document_id={entry['document_id']} "
+        f"section_path={entry['section_path']} chunk_id={entry['chunk_id']}"
+    )
+
+
+def _section_belongs_to_resolved_path(
+    section: DocumentSection,
+    *,
+    document_id: str,
+    job_result_id: str,
+    resolved_path: str,
+    mode: str,
+) -> bool:
+    if section.document_id != document_id or section.job_result_id != job_result_id:
+        return False
+    if mode == "descendants":
+        return (
+            section.section_path == resolved_path
+            or section.section_path.startswith(f"{resolved_path} / ")
+        )
+    return section.section_path == resolved_path
 
 async def _resolve_same_as_markers(
     db: Any,
@@ -76,6 +109,7 @@ async def _resolve_same_as_markers(
     source_file_name_by_doc: dict[str, str],
 ) -> None:
     """Mutate ``page`` rows in place, replacing SAME-AS markers with owner text."""
+    corpusStorage: CorpusStorage = CorpusStorage.resolve_document(next(iter(revision_by_doc), ''))
     matches_by_index: dict[int, list[tuple[str, str]]] = {}
     needed: set[tuple[str, str]] = set()
     for index, row in enumerate(rows):
@@ -105,13 +139,13 @@ async def _resolve_same_as_markers(
         if not job_result_id:
             continue
         result = await db.execute(
-            select(DocumentChunk.content)
-            .select_from(DocumentChunk)
-            .join(DocumentSection, DocumentSection.section_id == DocumentChunk.section_id)
-            .where(DocumentChunk.document_id == document_id)
-            .where(DocumentChunk.job_result_id == job_result_id)
-            .where(DocumentSection.section_path == owner_path)
-            .where(DocumentChunk.chunk_type == "page")
+            select(corpusStorage.DocumentChunk.content)
+            .select_from(corpusStorage.DocumentChunk)
+            .join(corpusStorage.DocumentSection, corpusStorage.DocumentSection.section_id == corpusStorage.DocumentChunk.section_id)
+            .where(corpusStorage.DocumentChunk.document_id == document_id)
+            .where(corpusStorage.DocumentChunk.job_result_id == job_result_id)
+            .where(corpusStorage.DocumentSection.section_path == owner_path)
+            .where(corpusStorage.DocumentChunk.chunk_type == "page")
         )
         content_row = result.first()
         owner_content[(document_id, owner_path)] = (
@@ -132,40 +166,92 @@ async def _resolve_same_as_markers(
         row["content"] = content
 
 
-def _normalize_read_refs(args: dict[str, Any]) -> list[Any]:
-    """Accept the canonical ``refs`` list, or a flat single-document shorthand.
+def _compose_explore_text(
+    row: dict[str, Any],
+    rows_by_chunk_id: dict[str, dict[str, Any]],
+    *,
+    char_budget: int,
+) -> str:
+    base_content = str(row.get("content") or "")
+    display = _explore_display_by_target(
+        row,
+        rows_by_chunk_id,
+        char_budget=char_budget,
+    )
+    if not display:
+        return base_content
+    metadata = row.get("chunk_metadata") or row.get("metadata") or {}
+    connections = (
+        metadata.get("connect_to") if isinstance(metadata, dict) else None
+    ) or []
+    content, _embedded = inline_assets_at_placeholders(
+        base_content,
+        connections=connections if isinstance(connections, list) else [],
+        display_by_target=display,
+    )
+    return content
 
-    Deterministic, not model-guessing: observed live tool calls sometimes
-    hoist ``document_id`` to the top level alongside ``section_path(s)`` /
-    ``chunk_id(s)`` instead of nesting each pair inside ``refs`` — the exact
-    shape the ``json_schema`` above documents. Rather than relying on the
-    model to always match the schema, normalize the known equivalent flat
-    shape here so a well-formed ``document_id`` isn't discarded over an
-    outer-structure mismatch. Does not change behavior when ``refs`` is
-    already a non-empty list.
-    """
-    refs = args.get("refs")
-    if isinstance(refs, list) and refs:
-        return refs
 
-    document_id = str(args.get("document_id") or "").strip()
-    if not document_id:
+def _explore_display_by_target(
+    row: dict[str, Any],
+    rows_by_chunk_id: dict[str, dict[str, Any]],
+    *,
+    char_budget: int,
+) -> dict[str, str]:
+    display: dict[str, str] = {}
+    for target_id in iter_connected_target_ids(row):
+        target_row = rows_by_chunk_id.get(target_id)
+        if not target_row:
+            continue
+        target_type = normalize_chunk_type(target_row.get("chunk_type"))
+        if target_type == "table":
+            target_content = render_explore_table(
+                target_row, char_budget=char_budget
+            )
+        elif target_type == "image":
+            target_content = _image_display_content(target_row)
+        else:
+            continue
+        if target_content:
+            display[target_id] = target_content
+    return display
+
+
+def _https_image_media(row: dict[str, Any]) -> list[dict[str, str]]:
+    if normalize_chunk_type(row.get("chunk_type")) != "image":
         return []
+    url = str(row.get("asset_url") or "").strip()
+    if url.startswith("https://"):
+        return [{"type": "image_url", "url": url}]
+    return []
 
-    normalized: list[dict[str, Any]] = []
-    section_path = args.get("section_path")
-    if isinstance(section_path, str) and section_path.strip():
-        normalized.append({"document_id": document_id, "section_path": section_path.strip()})
-    for path in args.get("section_paths") or []:
-        if isinstance(path, str) and path.strip():
-            normalized.append({"document_id": document_id, "section_path": path.strip()})
-    chunk_id = args.get("chunk_id")
-    if isinstance(chunk_id, str) and chunk_id.strip():
-        normalized.append({"document_id": document_id, "chunk_id": chunk_id.strip()})
-    for cid in args.get("chunk_ids") or []:
-        if isinstance(cid, str) and cid.strip():
-            normalized.append({"document_id": document_id, "chunk_id": cid.strip()})
-    return normalized
+
+def _collect_https_image_media(
+    assembled: list[dict[str, Any]],
+    *,
+    rows_by_chunk_id: dict[str, dict[str, Any]],
+    include_assets: bool,
+) -> list[dict[str, str]]:
+    media: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(row: dict[str, Any]) -> None:
+        for item in _https_image_media(row):
+            url = item["url"]
+            if url in seen:
+                continue
+            seen.add(url)
+            media.append(item)
+
+    for row in assembled:
+        _add(row)
+        if not include_assets:
+            continue
+        for target_id in iter_connected_target_ids(row):
+            target_row = rows_by_chunk_id.get(target_id)
+            if target_row:
+                _add(target_row)
+    return media
 
 
 @register_tool(
@@ -173,9 +259,13 @@ def _normalize_read_refs(args: dict[str, Any]) -> list[Any]:
     description=(
         "Read full body content for already-located sections or chunks. "
         "Resolves page-track SAME-AS pointers to the owner section's text, "
-        "inlines connect_to assets, and converts asset/page_assets "
-        "references to URLs. Use after outline/node_filter/recall/grep "
-        "have located where to look."
+        "inlines connect_to assets, loads table HTML (small tables in full; "
+        "large tables as row/column headers plus a pointer to "
+        "corpus.query_table), and converts asset/page_assets references to "
+        "URLs. Use after outline/node_filter/recall/grep have located where "
+        "to look. Each ref's outcome (ok, or failed with a reason) is "
+        "reported separately — decide pick/no-pick for each ref right "
+        "after seeing its status; a failed ref defaults to not picked."
     ),
     json_schema={
         "type": "object",
@@ -185,14 +275,26 @@ def _normalize_read_refs(args: dict[str, Any]) -> list[Any]:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "document_id": {"type": "string"},
-                        "section_path": {"type": "string"},
-                        "chunk_id": {"type": "string"},
+                        "document_id": {
+                            "type": "string",
+                            "description": "Document that owns this section or chunk.",
+                        },
+                        "section_path": {
+                            "type": "string",
+                            "description": "Section to read. Omit when chunk_id is set.",
+                        },
+                        "chunk_id": {
+                            "type": "string",
+                            "description": "Chunk to read. Omit when section_path is set.",
+                        },
                     },
                     "required": ["document_id"],
+                    "oneOf": REF_ADDRESS_ONE_OF,
+                    "additionalProperties": False,
+                    "description": REF_ADDRESS_RULE,
                 },
                 "minItems": 1,
-                "description": "Each ref needs document_id and either section_path or chunk_id.",
+                "description": "Each ref needs document_id and exactly one of section_path or chunk_id.",
             },
             "mode": {
                 "type": "string",
@@ -203,21 +305,32 @@ def _normalize_read_refs(args: dict[str, Any]) -> list[Any]:
                     "section_path ref; ignored for chunk_id refs."
                 ),
             },
-            "include_assets": {"type": "boolean", "default": True},
-            "resolve_same_as": {"type": "boolean", "default": True},
+            "include_assets": {
+                "type": "boolean",
+                "default": True,
+                "description": "Inline connect_to images and tables into the body.",
+            },
+            "resolve_same_as": {
+                "type": "boolean",
+                "default": True,
+                "description": "Replace page-track SAME-AS markers with the owner text.",
+            },
         },
         "required": ["refs"],
+        "additionalProperties": False,
     },
 )
 async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-    refs = _normalize_read_refs(args)
-    if not refs:
-        return ToolResult(text="", error="read requires refs")
+    corpusStorage: CorpusStorage = CorpusStorage.resolve_namespace(ctx.namespace)
+    refs = args.get("refs")
+    if not isinstance(refs, list) or not refs:
+        return ToolResult(text="", error="read requires a non-empty refs list")
     mode = str(args.get("mode") or "self").strip().lower()
     if mode not in ("self", "descendants"):
         return ToolResult(text="", error=f"unsupported mode: {mode}")
     include_assets = bool(args.get("include_assets", True))
     resolve_same_as_flag = bool(args.get("resolve_same_as", True))
+    char_budget = ctx.budget.max_chars
 
     document_ids = {
         str(ref.get("document_id") or "").strip() for ref in refs if ref.get("document_id")
@@ -225,36 +338,59 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     documents = (
         (
             await ctx.db.execute(
-                select(Document)
-                .where(Document.document_id.in_(document_ids))
-                .where(Document.user_id == ctx.user_id)
-                .where(Document.namespace == ctx.namespace)
-                .where(Document.status == "active")
-                .where(ctx.document_scope.predicate(Document.document_id))
+                select(corpusStorage.Document)
+                .where(corpusStorage.Document.document_id.in_(document_ids))
+                .where(corpusStorage.Document.user_id == corpusStorage.resolve_owner(ctx.user_id))
+                .where(corpusStorage.Document.namespace == ctx.namespace)
+                .where(corpusStorage.Document.status == "active")
+                .where(ctx.document_scope.predicate(corpusStorage.Document.document_id))
             )
         )
         .scalars()
         .all()
     )
     revision_by_doc = {
-        d.document_id: d.current_job_result_id for d in documents if d.current_job_result_id
+        d.document_id: revision for d in documents if (revision := CorpusRevisionContext.resolve_revision(d.document_id, d.current_job_result_id))
     }
     source_file_name_by_doc = {d.document_id: d.source_file_name or "" for d in documents}
     job_result_ids = sorted(set(revision_by_doc.values()))
     job_id_by_revision: dict[str, str] = {}
+    raw_prefix_by_revision: dict[str, str | None] = {}
     if job_result_ids:
         job_rows = await ctx.db.execute(
-            select(JobResult.id, JobResult.job_id).where(JobResult.id.in_(job_result_ids))
+            select(
+                JobResult.id, JobResult.job_id,
+                JobResult.document_metadata["result_raw_prefix"].as_string(),
+            ).where(JobResult.id.in_(job_result_ids))
         )
-        job_id_by_revision = {str(rid): str(jid) for rid, jid in job_rows.all() if rid and jid}
+        for revision_id, job_id, raw_prefix in job_rows.all():
+            if revision_id and job_id:
+                job_id_by_revision[str(revision_id)] = str(job_id)
+                raw_prefix_by_revision[str(revision_id)] = raw_prefix
 
-    base_rows: list[dict[str, Any]] = []
-    errors: list[str] = []
-    for ref in refs:
+    # One entry per input ref (by index), in call order — the per-ref
+    # ok/failed signal this tool now surfaces instead of a single joined
+    # error string. "pending" entries are finalized once section_job refs'
+    # matched chunks are known, below.
+    ref_status: list[dict[str, Any]] = [
+        {
+            "document_id": str(ref.get("document_id") or "").strip(),
+            "section_path": str(ref.get("section_path") or "").strip() or None,
+            "chunk_id": str(ref.get("chunk_id") or "").strip() or None,
+            "status": "pending",
+            "reason": None,
+            "chunk_ids": [],
+        }
+        for ref in refs
+    ]
+
+    emit_items: list[tuple[str, Any]] = []
+    for index, ref in enumerate(refs):
         document_id = str(ref.get("document_id") or "").strip()
         job_result_id = revision_by_doc.get(document_id)
         if not job_result_id:
-            errors.append(f"unknown document_id: {document_id}")
+            ref_status[index]["status"] = "failed"
+            ref_status[index]["reason"] = f"unknown document_id: {document_id}"
             continue
         chunk_id = str(ref.get("chunk_id") or "").strip()
         section_path = str(ref.get("section_path") or "").strip()
@@ -264,40 +400,50 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         if chunk_id:
             row = (
                 await ctx.db.execute(
-                    select(DocumentChunk, DocumentSection.section_path)
-                    .select_from(DocumentChunk)
+                    select(corpusStorage.DocumentChunk, corpusStorage.DocumentSection.section_path)
+                    .select_from(corpusStorage.DocumentChunk)
                     .outerjoin(
-                        DocumentSection,
-                        DocumentSection.section_id == DocumentChunk.section_id,
+                        corpusStorage.DocumentSection,
+                        corpusStorage.DocumentSection.section_id == corpusStorage.DocumentChunk.section_id,
                     )
-                    .where(DocumentChunk.document_id == document_id)
-                    .where(DocumentChunk.job_result_id == job_result_id)
-                    .where(DocumentChunk.chunk_id == chunk_id)
+                    .where(corpusStorage.DocumentChunk.document_id == document_id)
+                    .where(corpusStorage.DocumentChunk.job_result_id == job_result_id)
+                    .where(corpusStorage.DocumentChunk.chunk_id == chunk_id)
                 )
             ).first()
             if row is None:
-                errors.append(f"unknown chunk_id: {chunk_id} in {document_id}")
+                ref_status[index]["status"] = "failed"
+                ref_status[index]["reason"] = f"unknown chunk_id: {chunk_id} in {document_id}"
                 continue
             chunk, resolved_section_path = row
-            base_rows.append(
-                {
-                    "document_id": document_id,
-                    "job_result_id": job_result_id,
-                    "job_id": job_id,
-                    "source_file_name": source_file_name,
-                    "chunk_id": chunk.chunk_id,
-                    "section_id": chunk.section_id,
-                    "section_path": resolved_section_path,
-                    "chunk_type": chunk.chunk_type,
-                    "content": chunk.content,
-                    "chunk_metadata": chunk.chunk_metadata or {},
-                    "file_path": chunk.file_path,
-                }
+            ref_status[index]["status"] = "ok"
+            ref_status[index]["chunk_ids"] = [chunk.chunk_id]
+            emit_items.append(
+                (
+                    "chunk_rows",
+                    [
+                        {
+                            "document_id": document_id,
+                            "job_result_id": job_result_id,
+                            "job_id": job_id,
+                            "result_raw_prefix": raw_prefix_by_revision.get(job_result_id),
+                            "source_file_name": source_file_name,
+                            "chunk_id": chunk.chunk_id,
+                            "section_id": chunk.section_id,
+                            "section_path": resolved_section_path,
+                            "chunk_type": chunk.chunk_type,
+                            "content": chunk.content,
+                            "chunk_metadata": chunk.chunk_metadata or {},
+                            "file_path": chunk.file_path,
+                        }
+                    ],
+                )
             )
             continue
 
         if not section_path:
-            errors.append(f"ref for {document_id} needs section_path or chunk_id")
+            ref_status[index]["status"] = "failed"
+            ref_status[index]["reason"] = f"ref for {document_id} needs section_path or chunk_id"
             continue
 
         resolved_path, path_error = await resolve_section_path_anchor(
@@ -307,54 +453,115 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             section_path=section_path,
         )
         if path_error or not resolved_path:
-            errors.append(path_error or f"unknown section_path for {document_id}")
+            ref_status[index]["status"] = "failed"
+            ref_status[index]["reason"] = path_error or f"unknown section_path for {document_id}"
             continue
-
-        path_filter = (
-            section_path_subtree_filter(resolved_path)
-            if mode == "descendants"
-            else section_path_anchor_filter(resolved_path)
+        emit_items.append(
+            (
+                "section_job",
+                {
+                    "ref_index": index,
+                    "document_id": document_id,
+                    "job_result_id": job_result_id,
+                    "resolved_path": resolved_path,
+                    "source_file_name": source_file_name,
+                    "job_id": job_id,
+                    "result_raw_prefix": raw_prefix_by_revision.get(job_result_id),
+                },
+            )
         )
-        section_rows = (
+
+    section_jobs = [payload for kind, payload in emit_items if kind == "section_job"]
+    section_matches: list[DocumentSection] = []
+    batched_chunks: list[DocumentChunk] = []
+    if section_jobs:
+        path_clauses = []
+        for job in section_jobs:
+            path_filter = (
+                section_path_subtree_filter(job["resolved_path"], job["document_id"])
+                if mode == "descendants"
+                else section_path_anchor_filter(job["resolved_path"], job["document_id"])
+            )
+            path_clauses.append(
+                and_(
+                    corpusStorage.DocumentSection.document_id == job["document_id"],
+                    corpusStorage.DocumentSection.job_result_id == job["job_result_id"],
+                    path_filter,
+                )
+            )
+        section_matches = list(
             (
                 await ctx.db.execute(
-                    select(DocumentSection)
-                    .where(DocumentSection.document_id == document_id)
-                    .where(DocumentSection.job_result_id == job_result_id)
-                    .where(path_filter)
-                    .order_by(DocumentSection.sort_order)
+                    select(corpusStorage.DocumentSection).where(or_(*path_clauses))
                 )
             )
             .scalars()
             .all()
         )
-        section_ids = [s.section_id for s in section_rows]
-        chunk_rows = (
-            await ctx.db.execute(
-                select(DocumentChunk).where(
-                    DocumentChunk.document_id == document_id,
-                    DocumentChunk.job_result_id == job_result_id,
-                    DocumentChunk.section_id.in_(section_ids),
-                    # Body chunks only (text/page). image/table chunks share a
-                    # section_id with whichever section happens to store them
-                    # in the DB (always Root — CORPUS_SCHEMA.md §3), which is
-                    # not the same as "belonging" to that section; their real
-                    # association is connect_to on the body chunk, resolved
-                    # below via hydrate_connected_target_rows. Without this
-                    # filter, reading Root would return every still-unmounted
-                    # asset in the document as spurious top-level entries.
-                    DocumentChunk.chunk_type.in_(_BODY_CHUNK_TYPES),
+        section_ids = [section.section_id for section in section_matches]
+        if section_ids:
+            batched_chunks = list(
+                (
+                    await ctx.db.execute(
+                        select(corpusStorage.DocumentChunk).where(
+                            corpusStorage.DocumentChunk.document_id.in_(
+                                {job["document_id"] for job in section_jobs}
+                            ),
+                            corpusStorage.DocumentChunk.job_result_id.in_(
+                                {job["job_result_id"] for job in section_jobs}
+                            ),
+                            corpusStorage.DocumentChunk.section_id.in_(section_ids),
+                            # Body chunks only (text/page). image/table chunks share a
+                            # section_id with whichever section happens to store them
+                            # in the DB (always Root — CORPUS_SCHEMA.md §3), which is
+                            # not the same as "belonging" to that section; their real
+                            # association is connect_to on the body chunk, resolved
+                            # below via hydrate_connected_target_rows. Without this
+                            # filter, reading Root would return every still-unmounted
+                            # asset in the document as spurious top-level entries.
+                            corpusStorage.DocumentChunk.chunk_type.in_(_BODY_CHUNK_TYPES),
+                        )
+                    )
                 )
+                .scalars()
+                .all()
             )
-        ).scalars().all()
-        section_path_by_id = {s.section_id: s.section_path for s in section_rows}
-        for chunk in chunk_rows:
+
+    base_rows: list[dict[str, Any]] = []
+    for kind, payload in emit_items:
+        if kind == "chunk_rows":
+            base_rows.extend(payload)
+            continue
+        job = payload
+        ref_index = job["ref_index"]
+        matched_ids = {
+            section.section_id
+            for section in section_matches
+            if _section_belongs_to_resolved_path(
+                section,
+                document_id=job["document_id"],
+                job_result_id=job["job_result_id"],
+                resolved_path=job["resolved_path"],
+                mode=mode,
+            )
+        }
+        section_path_by_id = {
+            section.section_id: section.section_path
+            for section in section_matches
+            if section.section_id in matched_ids
+        }
+        job_chunk_ids: list[str] = []
+        for chunk in batched_chunks:
+            if chunk.section_id not in matched_ids:
+                continue
+            job_chunk_ids.append(chunk.chunk_id)
             base_rows.append(
                 {
-                    "document_id": document_id,
-                    "job_result_id": job_result_id,
-                    "job_id": job_id,
-                    "source_file_name": source_file_name,
+                    "document_id": job["document_id"],
+                    "job_result_id": job["job_result_id"],
+                    "job_id": job["job_id"],
+                    "result_raw_prefix": job.get("result_raw_prefix"),
+                    "source_file_name": job["source_file_name"],
                     "chunk_id": chunk.chunk_id,
                     "section_id": chunk.section_id,
                     "section_path": (
@@ -368,11 +575,28 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
                     "file_path": chunk.file_path,
                 }
             )
+        if job_chunk_ids:
+            ref_status[ref_index]["status"] = "ok"
+            ref_status[ref_index]["chunk_ids"] = job_chunk_ids
+        else:
+            ref_status[ref_index]["status"] = "failed"
+            ref_status[ref_index]["reason"] = (
+                f"no body chunk found for {job['resolved_path']} in "
+                f"{job['document_id']} (image/table-only or empty section)"
+            )
 
+    status_lines = [_ref_status_line(entry) for entry in ref_status]
     if not base_rows:
         return ToolResult(
-            text="",
-            error="no chunks resolved for given refs" + (f" ({'; '.join(errors)})" if errors else ""),
+            text="\n".join(status_lines),
+            payload={"chunks": [], "refs": ref_status},
+            error=(
+                "read: every ref failed, nothing was read:\n"
+                + "\n".join(status_lines)
+                + "\nNone of these can be picked for finish. Fix each ref "
+                "(copy document_id + section_path/chunk_id exactly from an "
+                "outline/node_filter/grep/recall/assets row) and retry."
+            ),
         )
 
     if resolve_same_as_flag:
@@ -391,47 +615,63 @@ async def read(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
             exclude_document_ids=[],
             document_scope=ctx.document_scope,
             exclude_sections=[],
+            revision_pins=CorpusRevisionContext.get_pins(),
         )
+    enriched_rows = await enrich_rows_with_retrieval_asset_url(
+        [*base_rows, *connected_rows],
+        log_context="agent_tools.read",
+    )
     rows_by_chunk_id = {
         str(row.get("chunk_id") or ""): row
-        for row in [*base_rows, *connected_rows]
+        for row in enriched_rows
         if row.get("chunk_id")
     }
+    base_ids = {str(row.get("chunk_id") or "") for row in base_rows}
 
     assembled: list[dict[str, Any]] = []
-    for row in base_rows:
+    for row in enriched_rows:
+        chunk_id = str(row.get("chunk_id") or "")
+        if chunk_id not in base_ids:
+            continue
         chunk_type = normalize_chunk_type(row.get("chunk_type"))
         composed = dict(row)
-        if chunk_type == "text":
-            composed["content"] = _compose_text_content(row, rows_by_chunk_id) if include_assets else row.get("content")
-        elif chunk_type == "page":
-            composed["content"] = _compose_text_content(row, rows_by_chunk_id) if include_assets else row.get("content")
+        if chunk_type in _BODY_CHUNK_TYPES:
+            composed["content"] = (
+                _compose_explore_text(
+                    row,
+                    rows_by_chunk_id,
+                    char_budget=char_budget,
+                )
+                if include_assets
+                else row.get("content")
+            )
         elif chunk_type == "table":
-            composed["content"] = _compose_table_content(row, rows_by_chunk_id)
+            composed["content"] = render_explore_table(
+                row, char_budget=char_budget
+            )
         elif chunk_type == "image":
             composed["content"] = _image_display_content(row)
         assembled.append(composed)
 
-    if include_assets:
-        assembled = await enrich_rows_with_retrieval_asset_url(
-            assembled, log_context="agent_tools.read"
-        )
-
-    lines = []
-    if errors:
-        lines.append(f"errors: {'; '.join(errors)}")
+    lines = ["refs:", *(f"  {line}" for line in status_lines), _PICK_REMINDER]
     for row in assembled:
         lines.append(
             f"### {row.get('source_file_name')} ({row.get('document_id')}) / "
             f"{row.get('section_path')} [{row.get('chunk_type')}]"
         )
         lines.append(str(row.get("content") or ""))
+    lines.append(_PICK_REMINDER)
 
     return ToolResult(
         text="\n".join(lines),
-        payload={"chunks": assembled, "errors": errors},
+        payload={"chunks": assembled, "refs": ref_status},
         refs=[
             {"document_id": row["document_id"], "chunk_id": row["chunk_id"]}
             for row in assembled
         ],
+        media=_collect_https_image_media(
+            assembled,
+            rows_by_chunk_id=rows_by_chunk_id,
+            include_assets=include_assets,
+        ),
     )

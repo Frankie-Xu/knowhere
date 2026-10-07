@@ -8,7 +8,7 @@ from custom_openapi import custom_openapi
 
 # Import from shared packages
 from shared.core.config import redis_pool_manager, settings
-from shared.core.database import engine, safe_dispose_engine
+from shared.core.database import dispose_all_engines
 from shared.core.logging import setup_logging
 
 # Import from local API project
@@ -28,6 +28,8 @@ async def lifespan(app: FastAPI):
     """
     Application lifecycle management
     """
+
+
     from shared.core.database import prewarm_connection_pool
 
     await prewarm_connection_pool()
@@ -44,6 +46,8 @@ async def lifespan(app: FastAPI):
     redis_url = redis_pool_manager.config.get_connection_url()
     RateLimitConfig.get_instance(redis_url)
     async with get_db_context() as session:
+        from shared.services.retrieval.demo_authorization import verify_runtime_database_role
+        await session.run_sync(verify_runtime_database_role)
         await load_rules(session)
     logger.info("rate limit rules loaded at startup; restart the pod to apply changes")
 
@@ -162,7 +166,7 @@ async def lifespan(app: FastAPI):
         logger.error(f"async HTTP client close failed: {e}")
 
     logger.info("Document API service stopped!")
-    await safe_dispose_engine(engine)
+    await dispose_all_engines()
     logger.info("database engine connection pool disposed.")
     logger.info("service stopped.")
 

@@ -28,12 +28,11 @@ class RetrievalQuery:
     chunk_types: set[str] | None = None
     signal_paths: list[str] | None = None
     filter_mode: str = "delete"
-    channels: list[str] | None = None
-    channel_weights: dict[str, float] | None = None
     rerank: bool = False
     threshold: float = 0.0
     internal_recall_k: int | None = None
     use_agentic: bool | None = None
+    agent_explore_model: str | None = None
     conversation_id: str | None = None
     llm_config: LLMConfig | None = None
     include_document_ids: list[str] | None = None
@@ -53,12 +52,11 @@ class RetrievalQuery:
         chunk_types: set[str] | None = None,
         signal_paths: list[str] | None = None,
         filter_mode: str = "delete",
-        channels: list[str] | None = None,
-        channel_weights: dict[str, float] | None = None,
         rerank: bool = False,
         threshold: float = 0.0,
         internal_recall_k: int | None = None,
         use_agentic: bool | None = None,
+        agent_explore_model: str | None = None,
         conversation_id: str | None = None,
         llm_config: LLMConfig | None = None,
     ) -> "RetrievalQuery":
@@ -74,12 +72,11 @@ class RetrievalQuery:
             chunk_types=chunk_types,
             signal_paths=signal_paths,
             filter_mode=filter_mode,
-            channels=channels,
-            channel_weights=channel_weights,
             rerank=rerank,
             threshold=threshold,
             internal_recall_k=internal_recall_k,
             use_agentic=use_agentic,
+            agent_explore_model=agent_explore_model,
             conversation_id=conversation_id,
             llm_config=llm_config,
         )
@@ -99,12 +96,11 @@ class RetrievalQuery:
             "chunk_types": sorted(self.chunk_types) if self.chunk_types else None,
             "signal_paths": self.signal_paths,
             "filter_mode": self.filter_mode,
-            "channels": self.channels,
-            "channel_weights": self.channel_weights,
             "rerank": self.rerank,
             "threshold": self.threshold,
             "internal_recall_k": self.internal_recall_k,
             "use_agentic": self.use_agentic,
+            "agent_explore_model": self.agent_explore_model,
             "llm_text_model": text_model,
             "llm_vision_model": vision_model,
             "harness": (
@@ -137,12 +133,11 @@ class RetrievalQuery:
             chunk_types=self.chunk_types,
             signal_paths=self.signal_paths,
             filter_mode=self.filter_mode,
-            channels=self.channels,
-            channel_weights=self.channel_weights,
             rerank=self.rerank,
             threshold=self.threshold,
             internal_recall_k=self.internal_recall_k,
             effective_recall_k=self.resolve_effective_recall_k(),
             use_agentic=self.use_agentic,
+            agent_explore_model=self.agent_explore_model,
             conversation_id=self.conversation_id,
         )
