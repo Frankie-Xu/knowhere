@@ -1,137 +1,131 @@
 # Document-centric list and history
 
-**Status:** Draft — RFC only, no implementation in this change
-**Related PRs:** [#232](https://github.com/Ontos-AI/knowhere/pull/232) (@gdccyuen), [#231](https://github.com/Ontos-AI/knowhere/pull/231) (@SusannaShu)
-**Maintainer review:** [suguanYang on #232](https://github.com/Ontos-AI/knowhere/pull/232#issuecomment-5265960465), [suguanYang on #231](https://github.com/Ontos-AI/knowhere/pull/231#issuecomment-5265855328)
-**Observed against:** `main` @ `9489fa2c` (2026-09-14)
+**Status:** Draft implementation — API decisions below require maintainer review
+**Related PRs:** [#232](https://github.com/Ontos-AI/knowhere/pull/232), [#231](https://github.com/Ontos-AI/knowhere/pull/231)
+**Maintainer direction:** [namespace ownership](https://github.com/Ontos-AI/knowhere/pull/232#issuecomment-5265960465), [processing ledger](https://github.com/Ontos-AI/knowhere/pull/231#issuecomment-5265855328)
+**Implementation base:** `main` @ `f9d61119` (2026-10-07)
 
-This is a unifying API-ownership draft. It does not replace or rewrite
-#232 / #231, and it does not include a code patch. Those PRs stay with
-their authors.
+Namespaces remain free-form client-owned isolation labels. Documents own the
+persisted corpus; jobs preserve processing attempts, billing and provenance.
+This implementation adds document-scoped history and explicit cross-namespace
+document listing. It does not change #231/#232 or their authors' branches.
 
-## Why this is an RFC
+## List documents
 
-Both PRs were blocked as **public API / resource-ownership** questions, not
-as local bugs:
-
-- #232 `GET /documents/namespaces` does not list a Knowhere resource.
-  Namespace is a client-owned isolation label with no identity, create
-  operation, metadata, authz, or lifecycle.
-- #231 `GET /jobs?namespace=` and job deletion treat a processing attempt as
-  a file registry. A job is the operational ledger and should remain after
-  the document is archived.
-
-Those are domain-contract changes. They should not land as drive-by
-route additions.
-
-## Resource ownership (from maintainer, restated)
-
-| Concept | Owns | Does not own |
-| --- | --- | --- |
-| Namespace | Client (tenant / folder / workspace id) | Knowhere registry, empty folders, archived-only labels |
-| Document | Persisted corpus: list, get, archive, retrieval scope | Processing attempts |
-| Job | One parse attempt: status, billing, errors, provenance | Tenant file listing, delete-from-folder |
-
-## Existing surface (do not duplicate)
-
-On current `main`:
-
-- `GET /v1/documents?namespace=` already lists the credential's documents
-  in that namespace (`apps/api/app/api/v1/routes/documents.py`).
-- `GET /v1/documents/{document_id}` and chunk listing already exist.
-- Removal from the active corpus is `POST /v1/documents/{document_id}/archive`
-  (plus a legacy `:archive` alias). There is no `DELETE /documents/{id}`.
-- `GET /v1/jobs` lists processing attempts with status/type/time filters.
-  It has **no** `namespace` query.
-- `GET /v1/jobs/{job_id}` inspects one attempt.
-
-The keyboard-backend / on-prem folder workflow that #231 and #232 were
-solving is therefore **mostly already on the document resource**:
-
-1. List a tenant folder: `GET /documents?namespace={label}`
-2. Remove a file from that folder: `POST /documents/{document_id}/archive`
-3. Poll a known upload: `GET /jobs/{job_id}` (client keeps the id while
-   pending)
-
-## Remaining gaps (only these need new API)
-
-### 1. Processing history under a document
-
-Suggested, not implemented:
+Existing calls keep their behavior on both `/api/v1` and `/api/v2`:
 
 ```http
-GET /v1/documents/{document_id}/jobs
+GET /api/v1/documents?namespace=tenant-42&page=1&page_size=50
 ```
 
-or, if the product name is "revisions":
+Omitting `namespace`, passing an empty value, or passing whitespace selects
+`default`. Listing returns non-archived documents for that namespace. It does
+not enumerate namespaces or represent empty folders.
+
+A reader whose client does not retain labels may now explicitly page through
+all of the credential owner's private documents:
 
 ```http
-GET /v1/documents/{document_id}/revisions
+GET /api/v1/documents?all_namespaces=true&page=1&page_size=50
 ```
 
-Returns the job ledger rows that produced this document (including failed
-retries), newest first. Jobs stay immutable. This is not job deletion and
-not a namespace filter on `GET /jobs`.
+The existing response envelope remains `namespace`, `documents`, `pagination`.
+For `all_namespaces=true`, the envelope's `namespace` is `null`; each document
+retains its actual namespace. Documents are ordered by `updated_at` descending,
+then `document_id` ascending. `namespace` and `all_namespaces=true` are mutually
+exclusive (400 `INVALID_ARGUMENT`), including an explicitly empty namespace value. Page size is
+1–200, default 50; page numbers start at 1.
 
-### 2. Pending uploads with no document yet
+The client may derive labels from the returned documents. Archived-only and
+empty labels have no entries. This reads private user-owned corpus rows;
+shared demo documents remain available through the existing explicit
+`namespace=__knowhere_demo__` query and are not mixed into this traversal.
 
-Clients should keep the job id returned at create time. If a self-hosted
-app must reconcile abandoned uploads without that id, design that around
-the existing external `data_id`, as a separate RFC. Do not add
-`GET /jobs?namespace=` as a file browser.
+## Read document processing history
 
-### 3. "What folders exist?" for an uploader ≠ consumer
+```http
+GET /api/v1/documents/{document_id}/jobs?page=1&page_size=50
+GET /api/v2/documents/{document_id}/jobs?page=1&page_size=50
+```
 
-#232's on-prem case (gdccyuen, 2026-08-13): one credential, many domain
-folders, the reader did not choose the namespace strings.
+The document must exist and belong to the credential owner. An archived
+private document remains readable. Missing documents, another user's
+documents, and initial uploads that have not materialized a document return
+404. An existing document with no associated jobs returns an empty page.
+Shared demo documents return an empty history; their internal publisher's
+processing and billing ledger is not exposed to corpus readers.
 
-Do **not** answer that with a Namespace resource.
+Each item summarizes one attempt; a failed or running attempt need not have a
+published revision:
 
-Options, in order of preference:
+```json
+{
+  "document_id": "doc_example",
+  "namespace": "tenant-42",
+  "jobs": [
+    {
+      "job_id": "job_retry",
+      "job_type": "document_ingestion",
+      "status": "failed",
+      "source_type": "file",
+      "error_code": "INVALID_ARGUMENT",
+      "page_count": null,
+      "credits_charged": 0,
+      "billing_status": "pending",
+      "created_at": "2026-10-07T10:00:00",
+      "updated_at": "2026-10-07T10:01:00",
+      "job_result_id": null,
+      "is_current_revision": false
+    }
+  ],
+  "pagination": {"page": 1, "page_size": 50, "total": 1, "total_pages": 1}
+}
+```
 
-1. **Derive from documents.** `GET /documents` (paged) already returns
-   each document's namespace. The client unique-sorts labels. Empty
-   folders do not exist in Knowhere; that matches "namespace appears only
-   after a document is created."
-2. If pagination makes (1) too expensive, an **explicitly administrative
-   document-aggregation** query (for example distinct `documents.namespace`
-   for non-archived rows under this credential) may be considered later. It
-   must not be named or documented as `GET /namespaces`, must not imply
-   empty namespaces, and must not be mounted as a first-class resource.
+Jobs are ordered by `created_at` descending, then `job_id` ascending so equal
+timestamps paginate consistently. Pagination has the same bounds as document
+listing. Counts and pages are separate reads, so concurrent submissions may
+change totals between requests; this is offset pagination, not a frozen
+snapshot.
 
-Archived-only labels stay out of that aggregation unless a later admin
-tool asks for them separately.
+Association rules:
 
-## What not to merge from #232 / #231
+1. `job_results.document_id` is the canonical persisted link and takes priority.
+2. When both the private and shared-demo canonical result links are absent
+   (including no result),
+   `jobs.job_metadata.document_id` associates failed, pending and legacy attempts.
+   A result published to a demo document cannot enter private history through
+   conflicting metadata.
+3. The job must independently belong to the requesting user. A namespace match,
+   filename or external `data_id` alone does not associate a job.
 
-- `GET /documents/namespaces` (or `/api/v2/documents/namespaces` via the
-  v1-mounted-under-v2 router) as a Namespace resource
-- `GET /jobs?namespace=` as a document-listing interface
-- `DELETE /jobs/{job_id}` / soft-delete of the processing ledger
-- Counting "active" documents as `status != archived` while calling them
-  "active document counts" without defining `status`
+Every associated result is represented once. `job_result_id` identifies the
+attempt's result when present; `is_current_revision` compares it with the
+current document pointer. Full job metadata, source URLs, result payloads,
+asset URLs and raw error messages are excluded from the summary. Use the
+existing `GET /jobs/{job_id}` to inspect a known attempt in detail.
 
-#231's discussion already includes agreement to drop the job-listing /
-job-deletion approach. This RFC records that direction so a future
-document-history PR does not revive those routes.
+Archiving removes the document from listing/retrieval and leaves its job ledger
+and document-scoped history readable. This endpoint has no deletion or hiding
+operation and performs no ledger mutation.
 
-## Testing expectations for a later implementation PR
+## Pending submissions and namespace ownership
 
-- Contract tests for `GET /documents?namespace=` remain the listing
-  interface (already present in `test_documents_contract.py`).
-- Any new `/documents/{id}/jobs` (or `/revisions`) test must show: archived
-  document still returns job history; deleting/archiving the document does
-  not hide jobs.
-- No test should encode `GET /jobs?namespace=` as the supported client
-  workflow.
+Clients retain the job ID returned at upload and poll `GET /jobs/{job_id}`.
+History is only available once the document exists. Durable reconciliation of
+abandoned initial uploads, potentially using external `data_id`, remains a
+separate design problem.
 
-## Ask
+No namespace registry, `GET /documents/namespaces`, namespace-filtered job
+listing or job deletion is introduced. No schema migration or environment
+configuration is required. `all_namespaces`, history association precedence,
+summary fields and demo behavior are local Draft decisions for review.
 
-@suguanYang: confirm (1) listing stays on `GET /documents?namespace=`,
-(2) history is document-scoped jobs/revisions, (3) no Namespace resource
-without a separate domain-contract change.
+## Verification
 
-@gdccyuen @SusannaShu: this is not a competing implementation of #232/#231.
-If you want to continue, the document-history route is the remaining
-gap; namespace discovery should be derived from documents or an explicit
-admin aggregation, not a namespace resource.
+`apps/api/tests/contract/test_document_history_contract.py` exercises actual
+HTTP routes with synthetic PostgreSQL data on v1 and v2: old/current revisions,
+failed and running attempts, canonical-only and legacy links, conflicting
+links, stable pagination, archive retention, job inspection, unknown/foreign
+and unmaterialized documents, empty history, authentication, pagination bounds,
+and cross-namespace listing with unchanged default/blank behavior.
