@@ -14,6 +14,8 @@ from loguru import logger
 
 import pandas as pd
 
+from shared.contracts.parse_result import SCHEMA_VERSION, validate_parse_result
+
 from shared.core.exceptions.domain_exceptions import (
     KnowhereException,
     StorageServiceException,
@@ -85,6 +87,15 @@ class ZipResultService:
                 hierarchy=hierarchy,
             )
             manifest = strip_manifest_cost_fields(manifest)
+            manifest = {"schema_version": SCHEMA_VERSION, **manifest}
+            if doc_nav is not None:
+                doc_nav = {"schema_version": SCHEMA_VERSION, **doc_nav}
+            validate_parse_result(
+                manifest,
+                {"schema_version": SCHEMA_VERSION, "chunks": formatted_chunks},
+                doc_nav,
+                allow_legacy=False,
+            )
             parse_track = str((job_metadata or {}).get("parse_track") or "")
             artifact = self._writer.write(
                 ZipPackageWriteRequest(

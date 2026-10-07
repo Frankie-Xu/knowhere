@@ -1,289 +1,123 @@
 # Parsed result ZIP contract
 
-**Status:** Draft — RFC only, no implementation in this change
+**Status:** Draft implementation; policy choices below remain unaccepted upstream.
 **Related issue:** [#45](https://github.com/Ontos-AI/knowhere/issues/45)
-**Prior proposal:** [nuemaan, 2026-06-12](https://github.com/Ontos-AI/knowhere/issues/45#issuecomment-4692240990)
-**Observed against:** `main` @ `9489fa2c` (2026-09-14)
 
-This document asks maintainers to lock three decisions before any models,
-JSON Schema export, or worker validation land. It does not change runtime
-behavior.
+The worker emits one versioned result ZIP. Its three JSON roots contain additive
+`schema_version: 1`: `chunks.json`, `doc_nav.json`, and `manifest.json`. The existing
+`doc_nav.version` (`"1.0"`) and `manifest.version` (`"2.0"`) remain unchanged.
+Pydantic v2 models in `packages/shared-python/shared/contracts/parse_result/` are
+its source of truth. Generated Draft 2020-12 JSON Schema lives in the
+language-neutral `packages/contracts/parse_result/` directory for SDK vendoring.
+Schema `$id` values identify the documents; they do not imply a hosted registry.
 
-## Purpose
+## Producer boundary
 
-The parse-result ZIP (`chunks.json`, `doc_nav.json`, `manifest.json`) is the
-de facto contract consumed by the Python SDK, Node SDK, notebooks, and
-other apps. Today those three JSON documents are written from dict payloads
-with no schema, no `schema_version` on `chunks.json`, and no pre-completion
-validation. A worker change can ship a break to SDK consumers without failing
-the job.
+`ZipResultService.generate_zip_package` validates the prepared JSON before
+calling the writer. `ZipPackageWriter` validates the closed ZIP before returning
+its checksum. This precedes `finalize_parse_success` uploading results and
+calling `finalize_job_success`. A contract violation raises the permanent domain
+exception `ParseResultContractException`; it follows the existing task failure
+handling and is not a transient storage retry. Invalid ZIPs are removed and are
+never returned to the upload path.
 
-Issue #45 asked for detection before the job completes. nuemaan proposed
-Pydantic models, a `validate_parse_result` helper, JSON Schema export, and
-`make sync-contracts`, then asked three scope questions. Maintainer has not
-replied. This RFC answers those questions against the current writers and
-asks for an explicit go / no-go.
+New successful packages require all three roots. Navigation generation failure,
+which previously logged a warning and omitted `doc_nav.json`, now fails the
+package. The already enriched navigation is retained, including extension fields
+such as `top_summary`; no on-disk corpus files are rewritten.
 
-## Current writers (facts)
+Multiple chunks may reference the same image, table, or page asset. The writer
+stores one ZIP member per asset path. Repeated paths with different contents
+fail with `conflicting_asset_path` rather than creating ambiguous ZIP entries.
 
-| Artifact | Writer | Informal version field today |
-| --- | --- | --- |
-| `chunks.json` | `ZipPackageWriter.write` via `{"chunks": formatted_chunks}` | none |
-| `doc_nav.json` | `ZipDocNavigationBuilder.build_doc_nav` (or an already-enriched on-disk file) | `"version": "1.0"` |
-| `manifest.json` | `ZipManifestBuilder.generate_manifest` | `"version": "2.0"` |
+## Version and compatibility policy
 
-Call chain for a successful job:
+- Version 1 captures current text, image, table, and page chunk shapes. Table
+  `content` may contain an asset path rather than inline HTML. Text `tokens` may
+  contain an integer count or a string list. `order` is not required.
+- Required scalar fields are strictly typed. Shared metadata requires `length`,
+  `summary`, and `page_nums`. Type-specific metadata, including page citation
+  assets and connections, is validated when present. Nested sections may omit
+  `level` in existing enriched navigation; their nesting defines depth.
+- Unknown fields are accepted and retained, including optional processing and
+  parser metadata. Additive optional fields do not bump the integer version.
+  Removing, renaming, or changing required fields/types requires a new version.
+- One ZIP has one supported version. Unknown or noninteger versions fail. The
+  legacy string `version` fields remain independent of `schema_version`.
+- `validate_parse_result` and `validate_parse_result_archive` default to a
+  compatibility read: missing root versions are interpreted as legacy v1 and
+  returned as warnings. Legacy unversioned manifests may omit navigation; a
+  package declaring version 1 must include it. Producer calls explicitly set
+  `allow_legacy=False`. The compatibility reader has no silent expiry; removing
+  legacy support requires a separately reviewed change.
 
-1. `finalize_parse_success` (`apps/worker/app/services/document_ingestion/success_finalization.py`)
-2. `_generate_result_package` → `ZipResultService.generate_zip_package`
-3. `format_chunks` / `build_doc_nav` / `generate_manifest`
-4. `ZipPackageWriter.write`
-5. S3 upload, then `lifecycle_service.finalize_job_success`
+```python
+from shared.contracts.parse_result import validate_parse_result_archive
 
-`test_parse_task_contract.py` asserts the three filenames exist and checks a
-few summary fields (`source_file_name`, `statistics.total_chunks`, chunk
-`type`). It does not validate inner shape, required keys, or types.
+result = validate_parse_result_archive("result.zip")
+print(result.manifest.schema_version)
+print(result.warnings)  # legacy-version/navigation compatibility notices
+```
 
-`AGENTS.md` "Persisted Document Corpus Schema" describes the on-disk
-`~/.knowhere/{corpus}` layout. That prose is useful but is not the SDK ZIP
-contract: it omits `chunk_type=page`, and table `content` in the ZIP is often
-a `tables/...` path rather than inline HTML (`test_table_asset_schema_contract.py`).
+The helpers make no network calls. Consumers can vendor the JSON Schema and use
+any Draft 2020-12 validator for individual JSON shapes. Cross-artifact checks and
+ZIP membership checks require equivalent consumer logic or the Python helper.
+This PR does not change the standalone Node or Python SDK repositories.
 
-`doc_nav.json` is currently best-effort. `ZipResultService._build_navigation_outputs`
-logs a warning and returns `None` on failure, and `ZipPackageWriter` then
-omits the file. SDKs that assume the file is always present can already break
-on a "successful" job.
+## Hard failures and warnings
 
-## Decisions requested
+Hard failures include malformed required JSON fields, unsupported versions,
+missing required artifacts, disagreement between actual chunk types/counts and
+manifest/navigation statistics, and invalid connection character spans. Manifest
+heading hierarchy is recursive string-keyed dictionaries with dictionary leaves.
 
-### 1. Schema location
+Archive validation reads members without extraction. It rejects unsafe member
+names, duplicate members, malformed JSON (including duplicate keys and nonfinite
+numbers), missing referenced `metadata.file_path` / page `artifact_ref` assets,
+and unreadable archives. Asset references must be relative paths under `images/`,
+`tables/`, or `page_citation_assets/`. Binary bytes, image dimensions, and model
+output quality are outside this contract. Consumer reads default to a 128 MiB
+limit for each JSON member; callers can choose `max_json_bytes`. The local writer
+validates its generated archive without that size limit.
 
-**Recommendation:** two-layer, Python models as source of truth.
-
-- Author models in `packages/shared-python/shared/contracts/parse_result/`
-  (Pydantic v2). Worker and shared tests import these directly. This matches
-  nuemaan's proposal and keeps validation next to the ZIP writers in
-  `packages/shared-python/shared/services/storage/`.
-- Export JSON Schema to language-neutral `packages/contracts/parse_result/`
-  so the Node SDK and any non-Python consumer can vendor files without
-  depending on `knowhere-shared`.
-- `make sync-contracts` regenerates the JSON Schema from the models. CI
-  fails if generated files drift.
-
-Do not put hand-written JSON Schema in `shared/` only: the Node SDK would
-have to vendor Python package paths. Do not start with a separate
-hand-authored `packages/contracts/` that Python then re-implements — that
-duplicates the source of truth.
-
-A later `packages/contracts` Python stub that only re-exports generated
-schema is fine; it is not required for v1.
-
-### 2. Contract violation: hard-fail the job
-
-**Recommendation:** hard-fail. `status=failed`, no ZIP upload, structured
-error naming the field path and `schema_version`.
-
-This is the reading of #45 ("detect the break before it reaches consumers").
-Soft-warn-and-upload still ships a malformed ZIP to SDKs.
-
-Mount point:
-
-- Validate **after** `formatted_chunks`, `doc_nav`, and `manifest` exist and
-  **before** `ZipPackageWriter.write` / S3 upload, inside
-  `ZipResultService.generate_zip_package`.
-- Raise a domain exception (new `ParseResultContractException` or reuse
-  `WorkerHandlingException`) that `finalize_parse_success` / the parse task
-  already maps to `status=failed`.
-- `user_message` names the artifact and field path
-  (`chunks.json / chunks[3].metadata.page_nums`). `internal_message` may
-  include the validator error. `internal_message` must not appear in
-  `to_client()`.
-
-Missing `doc_nav.json` (today optional) should be treated as a **v1
-required-file** violation if maintainers agree SDKs depend on it. If
-page-memory or fragment jobs legitimately omit it, say so here and keep it
-optional in schema_version 1. Default proposal: required for successful
-jobs.
-
-### 3. Versioning policy
-
-**Recommendation:** integer `schema_version` starting at `1`, independent of
-the existing informal `version` strings.
-
-- `schema_version` is a new integer field on all three JSON roots.
-- Do **not** reinterpret `manifest.version` (`"2.0"`) or `doc_nav.version`
-  (`"1.0"`) as the contract version. Those stay as observed fields in
-  schema_version 1 so current consumers keep working.
-- `chunks.json` has no version today. Adding `schema_version` is an additive
-  root field. Consumers that ignore unknown keys remain compatible.
-- Additive optional fields (new optional metadata key, extra stats counter):
-  **do not bump** `schema_version`. Consumers must ignore unknown keys.
-- Breaking changes (rename, remove, change type, make a previously optional
-  field required): **bump** `schema_version`. Worker writes only the new
-  version. Validator rejects payloads that do not match the version the
-  worker claims to emit.
-- No dual-write / mixed versions in one ZIP. One ZIP, one `schema_version`.
-- Transition: validator accepts a missing `schema_version` as `1` for a
-  single release, then requires the field. Call that out in the implementing
-  PR.
-
-Do not use semver strings (`1.1.0`) for this field. Integer comparison is
-enough and matches nuemaan's "starting at 1".
-
-## Observed schema_version 1 shape (lock this, do not invent)
-
-This is the shape `ZipResultService` actually writes on current `main`,
-including page-memory. Implementing PRs should encode this, not AGENTS.md.
-
-### `chunks.json`
+Only legacy root-version omission and legacy navigation omission are warnings.
+Errors expose the existing canonical `INTERNAL_ERROR` and a stable details object:
 
 ```json
 {
+  "reason": "PARSE_RESULT_CONTRACT_VIOLATION",
   "schema_version": 1,
-  "chunks": [
-    {
-      "chunk_id": "string",
-      "type": "text | image | table | page",
-      "content": "string",
-      "path": "string",
-      "metadata": {}
-    }
-  ]
+  "violations": [{
+    "artifact": "chunks.json",
+    "field": "chunks.0.metadata.length",
+    "reason": "int_type"
+  }]
 }
 ```
 
-Required per chunk: `chunk_id`, `type`, `content`, `path`, `metadata`.
-`type` is a closed enum: `text`, `image`, `table`, `page`.
+Error details contain artifact and field locations and machine-readable reasons,
+never document values, Pydantic input/context, archive paths, or hierarchy titles.
 
-Shared metadata (always present in `format_chunks`):
+## Updating schemas
 
-- `length` (int)
-- `summary` (string)
-- `page_nums` (list of int)
-
-Type-specific metadata the writer currently sets:
-
-- `text`: `tokens`, `keywords`, `connect_to`
-- `image`: `file_path` (when known), `keywords`, `tokens` (empty list)
-- `table`: `file_path`, `keywords`, `tokens`, `connect_to`
-- `page`: `keywords`, `connect_to`, optional `page_assets`
-
-`connect_to` items are either a target string or an object with `target`,
-`relation`, optional `ref`, `position: {start, end}`, `score`, `keywords`,
-`same_as_owner` (`ConnectionPayload` in `chunk_connections.py`).
-
-In-memory `ChunkPayload` also has `order`. The ZIP formatter **does not
-write `order`**. Do not require it in schema_version 1.
-
-Table `content` is often the asset path (`tables/table-1.html`), not the
-HTML body. Image `content` is description text plus an asset ref. Do not
-require HTML in `content` for `type=table`.
-
-### `doc_nav.json`
-
-```json
-{
-  "schema_version": 1,
-  "version": "1.0",
-  "file_name": "string",
-  "stats": {
-    "total_chunks": 0,
-    "text_chunks": 0,
-    "image_chunks": 0,
-    "table_chunks": 0,
-    "page_chunks": 0,
-    "max_depth": 0
-  },
-  "sections": [
-    {
-      "title": "string",
-      "path": "string",
-      "level": 1,
-      "summary": "string",
-      "chunk_count": 0,
-      "children": []
-    }
-  ],
-  "resources": {
-    "images": [{ "path": "string", "summary": "string" }],
-    "tables": [{ "path": "string", "summary": "string" }]
-  }
-}
+```bash
+make sync-contracts
+make check-contracts
 ```
 
-`stats.page_chunks` is already produced. A v1 schema that omits it would
-be a regression.
+The check runs in PR CI and fails when checked-in schema differs from generated
+models. Fixtures cover all four chunk types, enriched navigation, table asset
+paths, and page citation assets. Unit tests validate fixtures with both Pydantic
+and JSON Schema and exercise actual ZIP writing without external accounts.
+Worker task contract tests cover successful versioned packages and a malformed
+producer payload failing before upload.
 
-### `manifest.json`
+## Draft choices for review
 
-```json
-{
-  "schema_version": 1,
-  "version": "2.0",
-  "job_id": "string",
-  "data_id": null,
-  "source_file_name": "string",
-  "processing_date": "ISO-8601 Z",
-  "processing": {
-    "page_count": null,
-    "billing_status": null,
-    "cost": { "micro_dollars": null, "credits": null },
-    "timing": {
-      "started_at": null,
-      "completed_at": null,
-      "duration_ms": null
-    },
-    "stages": {}
-  },
-  "statistics": {
-    "total_chunks": 0,
-    "text_chunks": 0,
-    "image_chunks": 0,
-    "table_chunks": 0,
-    "page_chunks": 0,
-    "total_pages": null
-  },
-  "HIERARCHY": {}
-}
-```
-
-`strip_manifest_cost_fields` already removes `processing.cost_estimate`
-before the ZIP write. The ZIP contract must not require that internal field.
-
-## Testing plan (for the later implementation PR)
-
-Do not replace `test_parse_task_contract.py`. Split coverage:
-
-1. **Model unit tests** next to the new contracts package: happy path for
-   each artifact; one violation per required field; unknown `type`;
-   `internal_message` absent from `to_client()`.
-2. **Writer unit tests**: `ZipResultService.generate_zip_package` calls the
-   validator and does not write/upload when validation fails (mock writer).
-3. **One parse-task contract assertion**: a deliberately malformed payload
-   fails the job with `status=failed` and never uploads a ZIP. Keep the
-   existing "three files present + counts" checks as the happy-path smoke.
-
-## Non-goals (this RFC and any first implementation PR)
-
-- Changing ZIP member names or moving files
-- Adding a new ZIP format or SDK major version in the same PR as the
-  validator
-- Validating image/table binary bytes, only JSON shape
-- On-disk `~/.knowhere` corpus files outside the job result ZIP
-- New runtime dependencies beyond Pydantic (already in the tree) and the
-  JSON Schema export toolchain if one is added
-- Retrieval / BM25 / agent_explore
-
-## Open questions for maintainers
-
-1. Confirm schema location (shared-python models + generated
-   `packages/contracts/`) vs a contracts-only top-level package.
-2. Confirm hard-fail vs warn-and-upload.
-3. Confirm integer `schema_version` starting at 1, additive fields without
-   bump, breaking changes bump.
-4. Is `doc_nav.json` required on every successful job, including fragment /
-   image / page-memory?
-5. Should `schema_version` be required on the first implementing release, or
-   accepted-as-1 when missing for one release?
-
-Please answer on #45. No code until those five are explicit.
+The schema location, hard failure policy, required navigation for newly emitted
+packages, integer versioning, and continued legacy compatibility are local design
+choices implementing the unanswered scope questions in #45. They have not been
+confirmed by maintainers. The implementation is additive for successful current
+JSON output, with the intentional change that malformed output fails the job
+instead of reaching SDK consumers. There are no database migrations, new runtime
+dependencies, environment variables, or ZIP member renames.
