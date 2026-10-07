@@ -17,6 +17,10 @@ from .celery import CeleryConfig
 from .database import DatabaseConfig
 from .job import JobConfig
 from .mineru import MineruConfig
+from .publication import (
+    DEFAULT_PUBLICATION_NAMESPACE_SNAPSHOT_MAX_BYTES,
+    PublicationConfig,
+)
 from .qstash import QStashConfig
 from .redis import RedisConfig, RedisConfigManager, RedisPoolManager
 from .retrieval import RetrievalConfig
@@ -34,6 +38,8 @@ __all__ = [
     "JobConfig",
     "AIConfig",
     "MineruConfig",
+    "PublicationConfig",
+    "DEFAULT_PUBLICATION_NAMESPACE_SNAPSHOT_MAX_BYTES",
     "RetrievalConfig",
     "AppConfig",
     "app_config",

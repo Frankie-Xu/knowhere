@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-CHANNEL_WEIGHT_PATH = 1.0
-CHANNEL_WEIGHT_CONTENT = 2.0
 INTERNAL_RECALL_K_MULTIPLIER = 2
-RRF_K = 60
 DEFAULT_TOP_K = 10
 
 # Final evidence / tool-observation text budget (characters). Used by
 # agent tool-loop harness caps (``ToolBudget.max_chars``).
 EVIDENCE_TEXT_CHAR_BUDGET = 12_000
+
+# Explore-phase table policy (user-specified). A table is large when either
+# axis meets this size; the same number caps query_table SELECT rows.
+LARGE_TABLE_AXIS = 50
+QUERY_TABLE_NAME = "t"
 
 VALID_CHUNK_TYPES: set[str] = {"text", "image", "table", "page"}
 ASSET_CHUNK_TYPES: set[str] = {"image", "table"}

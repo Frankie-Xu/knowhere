@@ -19,19 +19,29 @@ when the agent cites a path without ancestor prefixes.
 
 from __future__ import annotations
 
+from shared.services.retrieval.corpus_revision_context import CorpusRevisionContext
+
+from shared.services.retrieval.corpus_storage import CorpusStorage
+
 from shared.services.retrieval.document_scope import DocumentScope
 
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models.database.document import Document, DocumentChunk, DocumentSection
 from shared.services.retrieval.agent_tools.section_path_lookup import (
     resolve_section_path_anchor,
 )
 
 _BODY_CHUNK_TYPES = ("text", "page")
+
+
+@dataclass
+class FinishRefResolution:
+    resolved: list[dict[str, Any]] = field(default_factory=list)
+    dropped: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def resolve_finish_refs(
@@ -41,44 +51,65 @@ async def resolve_finish_refs(
     namespace: str,
     refs: list[dict[str, Any]],
     document_scope: DocumentScope = DocumentScope(),
-) -> list[dict[str, Any]]:
-    """Return refs with ``chunk_id`` populated; drops refs that don't resolve."""
-    refs = [ref for ref in refs if document_scope.allows(str(ref.get("document_id") or "").strip())]
+) -> FinishRefResolution:
+    """Return refs with ``chunk_id`` populated; dropped refs keep a reason."""
+    corpusStorage: CorpusStorage = CorpusStorage.resolve_namespace(namespace)
+    resolution = FinishRefResolution()
+    scoped: list[dict[str, Any]] = []
+    for ref in refs:
+        document_id = str(ref.get("document_id") or "").strip()
+        if not document_id:
+            resolution.dropped.append({"ref": ref, "reason": "missing document_id"})
+            continue
+        if not document_scope.allows(document_id):
+            resolution.dropped.append(
+                {"ref": ref, "reason": f"document_id out of scope: {document_id}"}
+            )
+            continue
+        scoped.append(ref)
+
     document_ids = {
-        str(ref.get("document_id") or "").strip() for ref in refs if ref.get("document_id")
+        str(ref.get("document_id") or "").strip() for ref in scoped if ref.get("document_id")
     }
     if not document_ids:
-        return []
+        return resolution
 
     documents = (
         (
             await db.execute(
-                select(Document)
-                .where(Document.document_id.in_(document_ids))
-                .where(Document.user_id == user_id)
-                .where(Document.namespace == namespace)
-                .where(Document.status == "active")
-                .where(document_scope.predicate(Document.document_id))
+                select(corpusStorage.Document)
+                .where(corpusStorage.Document.document_id.in_(document_ids))
+                .where(corpusStorage.Document.user_id == corpusStorage.resolve_owner(user_id))
+                .where(corpusStorage.Document.namespace == namespace)
+                .where(corpusStorage.Document.status == "active")
+                .where(document_scope.predicate(corpusStorage.Document.document_id))
             )
         )
         .scalars()
         .all()
     )
     revision_by_doc = {
-        d.document_id: d.current_job_result_id for d in documents if d.current_job_result_id
+        d.document_id: revision for d in documents if (revision := CorpusRevisionContext.resolve_revision(d.document_id, d.current_job_result_id))
     }
 
-    resolved: list[dict[str, Any]] = []
-    for ref in refs:
+    for ref in scoped:
         document_id = str(ref.get("document_id") or "").strip()
         chunk_id = str(ref.get("chunk_id") or "").strip()
         if document_id and chunk_id:
-            resolved.append({"document_id": document_id, "chunk_id": chunk_id})
+            resolution.resolved.append({"document_id": document_id, "chunk_id": chunk_id})
             continue
 
         section_path = str(ref.get("section_path") or "").strip()
         job_result_id = revision_by_doc.get(document_id)
-        if not (document_id and section_path and job_result_id):
+        if not job_result_id:
+            resolution.dropped.append(
+                {"ref": ref, "reason": f"unknown document_id: {document_id}"}
+            )
+            continue
+        if not section_path:
+            resolution.dropped.append(
+                {"ref": ref, "reason": f"ref for {document_id} needs section_path or chunk_id"}
+            )
             continue
 
         resolved_path, path_error = await resolve_section_path_anchor(
@@ -88,24 +119,36 @@ async def resolve_finish_refs(
             section_path=section_path,
         )
         if path_error or not resolved_path:
+            resolution.dropped.append(
+                {
+                    "ref": ref,
+                    "reason": path_error or f"unknown section_path for {document_id}",
+                }
+            )
             continue
 
         row = (
             await db.execute(
-                select(DocumentChunk.chunk_id)
-                .select_from(DocumentChunk)
+                select(corpusStorage.DocumentChunk.chunk_id)
+                .select_from(corpusStorage.DocumentChunk)
                 .join(
-                    DocumentSection,
-                    DocumentSection.section_id == DocumentChunk.section_id,
+                    corpusStorage.DocumentSection,
+                    corpusStorage.DocumentSection.section_id == corpusStorage.DocumentChunk.section_id,
                 )
-                .where(DocumentChunk.document_id == document_id)
-                .where(DocumentChunk.job_result_id == job_result_id)
-                .where(DocumentSection.section_path == resolved_path)
-                .where(DocumentChunk.chunk_type.in_(_BODY_CHUNK_TYPES))
+                .where(corpusStorage.DocumentChunk.document_id == document_id)
+                .where(corpusStorage.DocumentChunk.job_result_id == job_result_id)
+                .where(corpusStorage.DocumentSection.section_path == resolved_path)
+                .where(corpusStorage.DocumentChunk.chunk_type.in_(_BODY_CHUNK_TYPES))
             )
         ).first()
         if row is None:
+            resolution.dropped.append(
+                {
+                    "ref": ref,
+                    "reason": f"no body chunk for {document_id}: {resolved_path}",
+                }
+            )
             continue
-        resolved.append({"document_id": document_id, "chunk_id": str(row[0])})
+        resolution.resolved.append({"document_id": document_id, "chunk_id": str(row[0])})
 
-    return resolved
+    return resolution

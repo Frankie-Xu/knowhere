@@ -7,7 +7,7 @@ from typing import Any, Literal
 from app.api.dependencies.current_user import with_current_user
 from app.services.rate_limit.data_structures import CurrentUser
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.core.database import get_db
@@ -64,20 +64,6 @@ class RetrievalQueryRequest(BaseModel):
     filter_mode: Literal["delete", "keep"] = Field(
         "delete", description="Signal path filter mode"
     )
-    channels: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Deprecated and unsupported by the persisted map-unit route. "
-            "Leave empty; explicit channel selection is rejected."
-        ),
-    )
-    channel_weights: dict[str, float] = Field(
-        default_factory=dict,
-        description=(
-            "Deprecated and unsupported by the persisted map-unit route. "
-            "Leave empty; explicit overrides are rejected."
-        ),
-    )
     rerank: bool = Field(False, description="Enable LLM reranking after RRF fusion")
     threshold: float = Field(0.0, ge=0.0, description="Minimum RRF score threshold")
     internal_recall_k: int | None = Field(
@@ -86,8 +72,20 @@ class RetrievalQueryRequest(BaseModel):
     use_agentic: bool | None = Field(
         None,
         description=(
-            "Agent explore (cursor_sdk harness by default) when unset/true. "
-            "Set false to force classic map-unit BM25 top-K retrieval."
+            "Turns agent retrieval on or off. False uses classic map-unit "
+            "BM25. Unset or true turns agent retrieval on; "
+            "AGENT_EXPLORE_HARNESS then selects Cursor (cursor_sdk) or "
+            "Knowhere's own harness (openai)."
+        ),
+    )
+    agent_explore_model: str | None = Field(
+        None,
+        max_length=255,
+        description=(
+            "Optional Cursor model when agent retrieval is on and "
+            "AGENT_EXPLORE_HARNESS=cursor_sdk. Omit or leave empty to use "
+            "AGENT_EXPLORE_CURSOR_MODEL (default composer-2.5). Ignored when "
+            "agent retrieval is off or the harness is openai."
         ),
     )
     conversation_id: str | None = Field(
@@ -98,15 +96,6 @@ class RetrievalQueryRequest(BaseModel):
             "retrieval tracing. Does not affect caching or result content."
         ),
     )
-
-    @field_validator("channels")
-    @classmethod
-    def validate_channels(cls, v: list[str]) -> list[str]:
-        valid = {"path", "content", "term"}
-        for ch in v:
-            if ch not in valid:
-                raise ValueError(f"Invalid channel: {ch}. Must be one of {valid}")
-        return v
 
     @field_validator("chunk_types")
     @classmethod
@@ -125,28 +114,18 @@ class RetrievalQueryRequest(BaseModel):
     def normalize_namespace(cls, namespace: str | None) -> str:
         return normalize_retrieval_namespace(namespace)
 
-    @model_validator(mode="after")
-    def reject_unsupported_channel_controls(self) -> "RetrievalQueryRequest":
-        if self.channels:
-            raise ValueError(
-                "channels is deprecated and unsupported; omit it and use the "
-                "persisted path/content map-unit scorer"
-            )
-        if self.channel_weights:
-            raise ValueError(
-                "channel_weights is deprecated and unsupported; omit it and use "
-                "the persisted path/content map-unit scorer"
-            )
-        return self
-
 
 class RetrievalQueryResponse(BaseModel):
     namespace: str
     query: str
     router_used: str
+    evidence: list[dict] = Field(
+        default_factory=list,
+        description="Composed evidence parts (text and inline images) for downstream agents.",
+    )
     evidence_text: str = Field(
         default="",
-        description="Hierarchical evidence text. Primary output for downstream agents.",
+        description="Text projection of evidence. Tables stay as HTML; images are data URLs.",
     )
     answer_text: str = Field(
         default="",
@@ -156,7 +135,10 @@ class RetrievalQueryResponse(BaseModel):
         ),
     )
     referenced_chunks: list[dict] = Field(default_factory=list)
-    results: list[dict] = Field(default_factory=list)
+    results: list[dict] = Field(
+        default_factory=list,
+        description="Raw path chunks for debug. Content keeps placeholders; composed parts live on evidence.",
+    )
     stop_reason: str | None = None
     failure_reason: str | None = None
     decision_trace: list[dict] | None = Field(
@@ -190,11 +172,25 @@ async def execute_retrieval_query(
     else:
         resolved_chunk_types = None
 
+    query = str(payload.query or "").strip()
+    if not query:
+        return {
+            "namespace": normalize_retrieval_namespace(payload.namespace),
+            "query": query,
+            "router_used": "empty_query_filtered",
+            "failure_reason": "empty query — retrieval was not run",
+            "evidence": [],
+            "evidence_text": "",
+            "answer_text": "",
+            "referenced_chunks": [],
+            "results": [],
+        }
+
     return await run_retrieval_query(
         db=db,
         user_id=current_user.user_id,
         namespace=normalize_retrieval_namespace(payload.namespace),
-        query=payload.query,
+        query=query,
         top_k=payload.top_k,
         include_document_ids=payload.include_document_ids,
         exclude_document_ids=payload.exclude_document_ids,
@@ -202,12 +198,15 @@ async def execute_retrieval_query(
         chunk_types=resolved_chunk_types,
         signal_paths=payload.signal_paths or None,
         filter_mode=payload.filter_mode,
-        channels=payload.channels or None,
-        channel_weights=payload.channel_weights or None,
         rerank=payload.rerank,
         threshold=payload.threshold,
         internal_recall_k=payload.internal_recall_k,
         use_agentic=payload.use_agentic,
+        agent_explore_model=(
+            str(payload.agent_explore_model).strip()
+            if payload.agent_explore_model
+            else None
+        ),
         conversation_id=payload.conversation_id,
         llm_config=llm_config,
     )

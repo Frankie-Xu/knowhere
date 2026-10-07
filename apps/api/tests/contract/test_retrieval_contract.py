@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.contract_database import ContractDatabase
 
+from shared.services.retrieval.agent_explore.ref_resolution import FinishRefResolution
 from shared.services.retrieval.execution import routes as retrieval_routes
 from shared.services.retrieval.execution.reference_resolver import (
     ResolvedWorkflowReferences,
@@ -189,6 +190,7 @@ async def test_should_return_seeded_retrieval_results_for_the_authenticated_user
     assert results[0]["score"] == 1.0
     assert results[0]["source"] == {
         "document_id": seeded_document["document_id"],
+        "job_result_id": seeded_document["job_result_id"],
         "source_file_name": "contract-retrieval.pdf",
         "section_path": "contract/intro",
     }
@@ -300,58 +302,6 @@ async def test_retrieval_should_use_classic_topk_when_agentic_is_false(
 
     response_json = cast(dict[str, object], response.json())
     assert response_json["router_used"] == "classic_topk"
-
-
-async def test_should_return_request_validation_failure_for_an_invalid_channel(
-    developer_api_client_factory: Callable[
-        [], AbstractAsyncContextManager[AsyncClient]
-    ],
-) -> None:
-    async with developer_api_client_factory() as api_client:
-        response = await api_client.post(
-            "/api/v1/retrieval/query",
-            json={
-                "namespace": "default",
-                "query": "alpha",
-                "channels": ["invalid-channel"],
-            },
-        )
-
-    assert response.status_code == 400
-    assert response.headers["x-request-id"]
-
-    response_json = cast(dict[str, object], response.json())
-    error = cast(dict[str, object], response_json["error"])
-    details = cast(dict[str, object], error["details"])
-    violations = cast(list[dict[str, object]], details["violations"])
-
-    assert response_json["success"] is False
-    assert error["code"] == "INVALID_ARGUMENT"
-    assert error["message"] == "Request validation failed"
-    assert violations[0]["field"] == "body.channels"
-    assert "Invalid channel" in cast(str, violations[0]["description"])
-
-
-async def test_should_reject_legacy_channel_controls(
-    developer_api_client_factory: Callable[
-        [], AbstractAsyncContextManager[AsyncClient]
-    ],
-) -> None:
-    async with developer_api_client_factory() as api_client:
-        response = await api_client.post(
-            "/api/v1/retrieval/query",
-            json={
-                "namespace": "default",
-                "query": "alpha",
-                "channels": ["content"],
-            },
-        )
-
-    assert response.status_code == 400
-    response_json = cast(dict[str, object], response.json())
-    error = cast(dict[str, object], response_json["error"])
-    assert error["code"] == "INVALID_ARGUMENT"
-    assert "deprecated and unsupported" in str(error)
 
 
 async def test_should_exclude_matching_document_ids_from_the_response(
@@ -486,7 +436,7 @@ class _FakeHarness:
 def _patch_harness(monkeypatch: MonkeyPatch, episode: Any) -> None:
     monkeypatch.setattr(
         "shared.services.retrieval.agent_explore.harness.resolve_harness",
-        lambda: _FakeHarness(episode),
+        lambda **_kwargs: _FakeHarness(episode),
     )
 
 
@@ -543,11 +493,13 @@ async def test_agent_explore_retrieval_should_return_seeded_chunk_via_fake_episo
     assert any(
         ref.get("chunk_id") == target["chunk_id"]
         and ref.get("document_id") == target["document_id"]
+        and ref.get("job_result_id") == target["job_result_id"]
         for ref in referenced_chunks
     )
     assert results[0]["content"] == "explore seeded EBITDA marker content"
     assert results[0]["source"] == {
         "document_id": target["document_id"],
+        "job_result_id": target["job_result_id"],
         "source_file_name": "target.pdf",
         "section_path": target["section_path"],
     }
@@ -818,7 +770,8 @@ async def test_agent_explore_should_release_route_session_before_final_hydration
             events.append("final_db_close")
 
     class FakeHarness:
-        async def run_episode(self, **_kwargs: object) -> EpisodeResult:
+        async def run_episode(self, **kwargs: object) -> EpisodeResult:
+            assert kwargs["db_factory"] is retrieval_routes.open_agent_explore_database_context
             events.append("episode")
             assert events[:2] == ["route_rollback", "episode"]
             # Model an episode exceeding a simulated idle-in-transaction
@@ -850,12 +803,14 @@ async def test_agent_explore_should_release_route_session_before_final_hydration
     async def fake_resolve_finish_refs(
         db: AsyncSession,
         **_kwargs: object,
-    ) -> list[dict[str, str]]:
+    ) -> FinishRefResolution:
         assert db is final_db
         assert _kwargs["user_id"] == "contract-user"
         assert _kwargs["namespace"] == "contract-namespace"
         events.append("resolve_finish_refs")
-        return [{"document_id": "doc_contract", "chunk_id": "chunk_contract"}]
+        return FinishRefResolution(
+            resolved=[{"document_id": "doc_contract", "chunk_id": "chunk_contract"}]
+        )
 
     async def fake_resolve_workflow_references(
         *,
@@ -908,7 +863,7 @@ async def test_agent_explore_should_release_route_session_before_final_hydration
     monkeypatch.setattr(retrieval_routes, "open_fresh_database_context", fake_open_fresh_database_context)
     monkeypatch.setattr(
         "shared.services.retrieval.agent_explore.harness.resolve_harness",
-        lambda: FakeHarness(),
+        lambda **_kwargs: FakeHarness(),
     )
     monkeypatch.setattr(
         "shared.services.retrieval.agent_explore.ref_resolution.resolve_finish_refs",
@@ -931,8 +886,6 @@ async def test_agent_explore_should_release_route_session_before_final_hydration
             chunk_types=None,
             signal_paths=None,
             filter_mode="delete",
-            channels=None,
-            channel_weights=None,
             rerank=False,
             threshold=0.0,
             internal_recall_k=None,

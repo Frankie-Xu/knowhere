@@ -142,20 +142,7 @@ async def test_scope_matrix_all_corpus_tools_and_refs(developer_api_client_facto
             for name, args in [
                 ("list_documents", {}),
                 ("grep", {"pattern": "scopeprobe"}),
-                ("grep", {"pattern": "scopeprobe", "document_ids": ids}),
-                ("recall", {"query": "scopeprobe", "channels": ["term"], "top_k": 50}),
-                (
-                    "recall",
-                    {"query": "scopeprobe", "channels": ["path_content"], "top_k": 50},
-                ),
-                ("recall", {"query": "scopeprobe", "document_ids": ids, "top_k": 50}),
-                (
-                    "node_filter",
-                    {
-                        "document_ids": ids,
-                        "predicates": [{"field": "path", "terms": ["Section"]}],
-                    },
-                ),
+                ("recall", {"query": "scopeprobe", "limit": 50}),
                 ("assets", {}),
                 (
                     "assets",
@@ -177,21 +164,53 @@ async def test_scope_matrix_all_corpus_tools_and_refs(developer_api_client_facto
                 )
                 if expected:
                     assert result.error is None, (name, result.error)
+            # scope only ever names documents this call is actually allowed
+            # to see (an out-of-boundary document_id fails resolve_scope, by
+            # design — see agent_tools/scope.py) — a legitimately-scoped
+            # call must still narrow correctly to those docs.
+            if expected:
+                scope_expected = [{"document_id": doc_id} for doc_id in sorted(expected)]
+                for name, args in [
+                    ("grep", {"pattern": "scopeprobe", "scope": scope_expected}),
+                    (
+                        "recall",
+                        {"query": "scopeprobe", "scope": scope_expected, "limit": 50},
+                    ),
+                    (
+                        "node_filter",
+                        {
+                            "scope": scope_expected,
+                            "predicates": [{"field": "path", "terms": ["Section"]}],
+                        },
+                    ),
+                    ("assets", {"scope": scope_expected}),
+                ]:
+                    result = await call(name, args)
+                    assert result.error is None, (name, result.error)
+                    assert {ref["document_id"] for ref in result.refs} == expected, (
+                        name,
+                        include,
+                        exclude,
+                        result,
+                    )
             for doc_id in ids:
-                outline = await call("outline", {"document_id": doc_id})
+                outline = await call("outline", {"scope": [{"document_id": doc_id}]})
                 assert {r["document_id"] for r in outline.refs} == ({doc_id} & expected)
                 neighbors = await call("neighbors", {"document_id": doc_id})
                 assert {r["document_id"] for r in neighbors.refs} == (
                     expected - {doc_id} if doc_id in expected else set()
                 )
-            # Explicit tool selectors cannot widen the request boundary.
+            # Explicit tool selectors cannot widen the request boundary: naming
+            # an out-of-boundary document_id in scope fails resolve_scope, so
+            # no refs (and no data) ever come back for it.
             if expected:
                 outside = next((doc for doc in ids if doc not in expected), None)
                 if outside:
+                    outside_scope = [{"document_id": outside}]
                     for name, args in [
-                        ("grep", {"pattern": "scopeprobe", "document_ids": [outside]}),
-                        ("recall", {"query": "scopeprobe", "document_ids": [outside]}),
-                        ("assets", {"document_ids": [outside]}),
+                        ("grep", {"pattern": "scopeprobe", "scope": outside_scope}),
+                        ("recall", {"query": "scopeprobe", "scope": outside_scope}),
+                        ("assets", {"scope": outside_scope}),
                     ]:
                         assert not (await call(name, args)).refs
             async with contract_db_session() as db:
@@ -202,7 +221,7 @@ async def test_scope_matrix_all_corpus_tools_and_refs(developer_api_client_facto
                     refs=refs,
                     document_scope=scope,
                 )
-                assert {r["document_id"] for r in final_refs} == expected
+                assert {r["document_id"] for r in final_refs.resolved} == expected
                 padded_refs = await resolve_finish_refs(
                     db,
                     user_id="local-dev-user",
@@ -216,7 +235,7 @@ async def test_scope_matrix_all_corpus_tools_and_refs(developer_api_client_facto
                     ],
                     document_scope=scope,
                 )
-                assert padded_refs == final_refs
+                assert padded_refs.resolved == final_refs.resolved
 
 
 @pytest.mark.parametrize("version", ["v1", "v2"])
@@ -303,7 +322,7 @@ async def test_agent_scope_survives_dispatch_and_untrusted_finish(
 
             monkeypatch.setattr(
                 "shared.services.retrieval.agent_explore.harness.resolve_harness",
-                lambda: Harness(),
+                lambda **_kwargs: Harness(),
             )
             response = await client.post(
                 "/api/v1/retrieval/query",
@@ -387,7 +406,8 @@ async def test_connected_hydration_and_assembly_reject_outside_rows(
                 )
                 assert {r["document_id"] for r in assembled} == expected
                 for row in assembled:
-                    assert "asset secret" in row["content"]
+                    # content stays raw for debug; compose keeps the placeholder intact.
+                    assert "[images/" in row["content"]
 
 
 def test_cache_scope_none_empty_and_set_identity():
@@ -413,6 +433,20 @@ def test_cache_scope_none_empty_and_set_identity():
         == 5
     )
     assert digest(["b", "a", "a"]) == digest(["a", "b"])
+
+
+def test_cache_digest_changes_with_agent_explore_model() -> None:
+    def digest(model: str | None) -> str:
+        return _cache_shape_digest(
+            query="same",
+            top_k=10,
+            exclude_document_ids=[],
+            exclude_sections=[],
+            agent_explore_model=model,
+        )
+
+    assert digest(None) != digest("grok-4.6")
+    assert digest("grok-4.6") == digest("grok-4.6")
 
 
 async def test_legacy_excludes_only_narrow_scope_in_database(
@@ -513,9 +547,13 @@ async def test_real_harness_provider_loop_scopes_postgresql_tools(
                 id="grep",
                 function=SimpleNamespace(
                     name="corpus_grep",
-                    arguments=json.dumps(
-                        {"pattern": "scopeprobe", "document_ids": ids}
-                    ),
+                    # No explicit scope: document_scope (already bound into
+                    # this episode) is the only boundary in effect here —
+                    # naming an out-of-boundary document_id in scope would
+                    # fail the call instead of silently narrowing (see
+                    # agent_tools/scope.py), which isn't what this test
+                    # exercises.
+                    arguments=json.dumps({"pattern": "scopeprobe"}),
                 ),
             ),
         ]
