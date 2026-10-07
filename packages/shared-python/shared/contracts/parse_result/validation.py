@@ -28,7 +28,7 @@ def _fail(artifact: str, field: str, reason: str) -> NoReturn:
     raise ParseResultContractException(
         violations=[{"artifact": artifact, "field": field, "reason": reason}],
         schema_version=SCHEMA_VERSION,
-    )
+    ) from None
 
 
 def _model(
@@ -50,6 +50,7 @@ def _model(
     try:
         return model.model_validate(value)
     except ValidationError as exc:
+        # Suppress the raw validation traceback so logs cannot expose input values.
         # Never copy Pydantic input/ctx/message, which may contain document text.
         raise ParseResultContractException(
             violations=[
@@ -65,7 +66,7 @@ def _model(
                 for item in exc.errors(include_input=False, include_context=False)
             ],
             schema_version=SCHEMA_VERSION,
-        ) from exc
+        ) from None
 
 
 def validate_parse_result(

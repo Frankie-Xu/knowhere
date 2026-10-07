@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import pickle
+import traceback
 from pathlib import Path
 import warnings
 import zipfile
@@ -114,6 +115,7 @@ def test_malformed_chunk_fields_are_sanitized(payloads, field, value):
     client = error.value.to_client("request")
     assert client["error"]["details"]["schema_version"] == 1
     assert "private customer content" not in json.dumps(client)
+    assert "private customer content" not in "".join(traceback.format_exception(error.value))
     assert "input" not in json.dumps(client)
     assert pickle.loads(pickle.dumps(error.value)).details == error.value.details
 
