@@ -97,6 +97,8 @@ Errors expose the existing canonical `INTERNAL_ERROR` and a stable details objec
 
 Error details contain artifact and field locations and machine-readable reasons,
 never document values, Pydantic input/context, archive paths, or hierarchy titles.
+The canonical exception logger records these structured fields without the
+validation traceback, so diagnostic log sinks cannot expand document locals.
 
 ## Updating schemas
 

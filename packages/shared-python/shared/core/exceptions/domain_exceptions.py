@@ -689,6 +689,8 @@ class StorageServiceException(KnowhereException):
 class ParseResultContractException(KnowhereException):
     """A producer/consumer ZIP contract violation; details never contain input values."""
 
+    log_traceback = False
+
     def __init__(self, *, violations: List[Dict[str, str]], schema_version: int):
         super().__init__(
             code=ErrorCode.INTERNAL_ERROR,

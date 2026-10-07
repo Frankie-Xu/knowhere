@@ -10,6 +10,7 @@ import zipfile
 
 import pytest
 from jsonschema import Draft202012Validator
+from loguru import logger
 
 from shared.contracts.parse_result import (
     validate_parse_result,
@@ -201,6 +202,33 @@ def test_malformed_hierarchy_does_not_expose_customer_headings(payloads):
         error.value.to_client("request")
     )
     assert error.value.details["violations"][0]["field"] == "HIERARCHY"
+
+
+def test_canonical_logging_does_not_render_document_locals(payloads):
+    secret = "private-document-content-in-diagnostic-locals"
+    payloads[1]["chunks"][0]["content"] = {"secret": secret}
+    chunks = {"customer_content": secret, **payloads[1]}
+    messages = []
+    sink = logger.add(
+        messages.append,
+        format="{extra} {message}",
+        diagnose=True,
+        backtrace=True,
+    )
+    try:
+        with pytest.raises(ParseResultContractException) as error:
+            validate_parse_result(payloads[0], chunks, payloads[2])
+        error.value.logging(job_id="synthetic-job")
+    finally:
+        logger.remove(sink)
+
+    assert len(messages) == 1
+    assert secret not in str(messages[0])
+    assert messages[0].record["exception"] is None
+    extra = messages[0].record["extra"]
+    assert extra["event"] == "exception.system"
+    assert extra["job_id"] == "synthetic-job"
+    assert extra["details"]["reason"] == "PARSE_RESULT_CONTRACT_VIOLATION"
 
 
 @pytest.mark.parametrize(
