@@ -101,6 +101,18 @@ async def test_document_history_keeps_attempts_and_revisions_after_archive(
                 job_id=job_id,
                 document_id=document_id,
             )
+        for revision in ("old", "current"):
+            await ContractDatabase.insert_document_chunk(
+                chunk_id=f"chunk_{revision}",
+                user_id="local-dev-user",
+                namespace="history",
+                document_id="doc_history",
+                job_result_id=f"result_{revision}",
+                section_id=None,
+                chunk_type="text",
+                content=f"{revision} revision content",
+                section_path=f"{revision}.json",
+            )
         await ContractDatabase.execute(
             "UPDATE documents SET current_job_result_id = 'result_current' WHERE document_id = 'doc_history'"
         )
@@ -125,6 +137,20 @@ async def test_document_history_keeps_attempts_and_revisions_after_archive(
         assert body["jobs"][1]["job_result_id"] == "result_legacy"
         assert body["jobs"][1]["error_code"] == "INVALID_ARGUMENT"
         assert all("job_metadata" not in job for job in body["jobs"])
+        older_result_id = next(
+            job["job_result_id"] for job in body["jobs"] if job["job_id"] == "job_old"
+        )
+        chunks_url = f"/api/{version}/documents/doc_history/chunks"
+        older_revision = await client.get(
+            chunks_url, params={"job_result_id": older_result_id}
+        )
+        assert older_revision.status_code == 200
+        older_payload = older_revision.json()
+        assert older_payload["job_result_id"] == "result_old"
+        assert older_payload["job_id"] == "job_old"
+        assert [chunk["content"] for chunk in older_payload["chunks"]] == [
+            "old revision content"
+        ]
         pages = [
             await client.get(url, params={"page": page, "page_size": 2})
             for page in (1, 2, 3, 4)
@@ -144,6 +170,11 @@ async def test_document_history_keeps_attempts_and_revisions_after_archive(
         after = await client.get(url)
         assert after.status_code == 200
         assert after.json() == body
+        archived_revision = await client.get(
+            chunks_url, params={"job_result_id": older_result_id}
+        )
+        assert archived_revision.status_code == 200
+        assert archived_revision.json() == older_payload
         listing = await client.get(
             f"/api/{version}/documents", params={"namespace": "history"}
         )

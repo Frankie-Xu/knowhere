@@ -103,7 +103,10 @@ Every associated result is represented once. `job_result_id` identifies the
 attempt's result when present; `is_current_revision` compares it with the
 current document pointer. Full job metadata, source URLs, result payloads,
 asset URLs and raw error messages are excluded from the summary. Use the
-existing `GET /jobs/{job_id}` to inspect a known attempt in detail.
+existing `GET /jobs/{job_id}` to inspect a known attempt in detail. A returned
+published `job_result_id` can select an older revision through the existing
+`GET /documents/{document_id}/chunks?job_result_id=...`, including after private
+archive. Private document detail continues to describe the current document.
 
 Archiving removes the document from listing/retrieval and leaves its job ledger
 and document-scoped history readable. This endpoint has no deletion or hiding
@@ -128,4 +131,5 @@ HTTP routes with synthetic PostgreSQL data on v1 and v2: old/current revisions,
 failed and running attempts, canonical-only and legacy links, conflicting
 links, stable pagination, archive retention, job inspection, unknown/foreign
 and unmaterialized documents, empty history, authentication, pagination bounds,
-and cross-namespace listing with unchanged default/blank behavior.
+cross-namespace listing with unchanged default/blank behavior, and reading an
+older revision's chunks from a history result ID before and after archive.
