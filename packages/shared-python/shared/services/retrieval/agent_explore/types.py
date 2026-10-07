@@ -18,6 +18,9 @@ class AgentStep:
     elapsed_ms: int
     tokens_used_delta: int
     tokens_used_total: int
+    # corpus.read only: one {ref, status, reason?} entry per requested ref,
+    # kept whole in the trace (observation_text is capped there).
+    ref_status: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -30,3 +33,5 @@ class EpisodeResult:
     stop_reason: str = "finished"
     tokens_used: int = 0
     model_name: str = ""
+    agent_selected_refs: list[dict[str, Any]] | None = None
+    fallback_refs: list[dict[str, Any]] = field(default_factory=list)
