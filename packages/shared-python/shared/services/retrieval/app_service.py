@@ -9,9 +9,8 @@ from shared.models.schemas.retrieval_namespace import normalize_retrieval_namesp
 from shared.services.retrieval.execution.plan import (
     run_retrieval_query as execute_retrieval_query,
 )
-from shared.services.retrieval.search.scoring import merge_channels_rrf
 
-__all__ = ["merge_channels_rrf", "run_retrieval_query"]
+__all__ = ["run_retrieval_query"]
 
 
 async def run_retrieval_query(
@@ -25,14 +24,13 @@ async def run_retrieval_query(
     exclude_sections: list[dict[str, str]],
     include_document_ids: list[str] | None = None,
     chunk_types: set[str] | None = None,
-    signal_paths: list[str] | None = None,
-    filter_mode: str = "delete",
-    channels: list[str] | None = None,
-    channel_weights: dict[str, float] | None = None,
-    rerank: bool = False,
+        signal_paths: list[str] | None = None,
+        filter_mode: str = "delete",
+        rerank: bool = False,
     threshold: float = 0.0,
     internal_recall_k: int | None = None,
     use_agentic: bool | None = None,
+    agent_explore_model: str | None = None,
     conversation_id: str | None = None,
     llm_config: LLMConfig | None = None,
 ) -> dict[str, Any]:
@@ -48,12 +46,11 @@ async def run_retrieval_query(
         chunk_types=chunk_types,
         signal_paths=signal_paths,
         filter_mode=filter_mode,
-        channels=channels,
-        channel_weights=channel_weights,
         rerank=rerank,
         threshold=threshold,
         internal_recall_k=internal_recall_k,
         use_agentic=use_agentic,
+        agent_explore_model=agent_explore_model,
         conversation_id=conversation_id,
         llm_config=llm_config,
     )

@@ -13,11 +13,13 @@ from shared.services.retrieval.execution.route_types import (
     RetrievalRouteContext,
     RetrievalRouteOutcome,
 )
-from shared.services.retrieval.hydration.evidence_text import render_evidence_blocks
+from shared.services.retrieval.hydration.evidence_compose import (
+    collect_evidence,
+    flatten_parts,
+)
 from shared.services.retrieval.hydration.result_assembly import (
     assemble_retrieval_results,
 )
-from shared.services.retrieval.search.lexical_text import split_section_path
 from shared.services.retrieval.search.map_unit_discovery import map_unit_discovery
 from shared.services.retrieval.search.ranking import rank_retrieval_candidates
 from shared.services.retrieval.search.scoped_corpus import (
@@ -33,29 +35,28 @@ def open_fresh_database_context() -> AbstractAsyncContextManager[AsyncSession]:
     return get_db_context()
 
 
-def _evidence_path_header(row: dict) -> str:
-    source = row.get("source")
-    if not isinstance(source, dict):
-        source = row
-    file_name = str(source.get("source_file_name") or "").strip()
-    section_path = str(source.get("section_path") or "").strip()
-    parts = split_section_path(section_path)
-    if len(parts) > 1:
-        section_path = " / ".join(parts[:-1])
-    if file_name and section_path:
-        return f"{file_name} / {section_path}"
-    return file_name or section_path
+def open_agent_explore_database_context() -> AbstractAsyncContextManager[AsyncSession]:
+    """Open a tool-dispatch session whose timeouts match the episode wall clock."""
+    from shared.core.database import get_db_context_with_timeouts
+    from shared.services.retrieval.agent_explore.config import (
+        AGENT_EXPLORE_WALL_CLOCK_SECONDS,
+    )
+
+    timeout_seconds = int(AGENT_EXPLORE_WALL_CLOCK_SECONDS)
+    return get_db_context_with_timeouts(
+        statement_timeout_ms=timeout_seconds * 1000,
+        command_timeout_seconds=timeout_seconds,
+    )
 
 
-def _render_rows_evidence(rows: list[dict]) -> str:
-    groups: dict[str, list[str]] = {}
-    for row in rows:
-        header = _evidence_path_header(row)
-        content = str(row.get("content") or "").strip()
-        if not content:
-            continue
-        groups.setdefault(header, []).append(content)
-    return render_evidence_blocks(list(groups.items()))
+def _evidence_fields(rows: list[dict]) -> dict:
+    # TODO: 后面用 TypeSafe JEV 补结果重排/筛选。现在没有这一步。
+    # 无论怎么做，发出去的 evidence 和 results 都是已经筛过或重排过的完整列表，不在 Knowhere 外面做。
+    evidence = collect_evidence(rows)
+    return {
+        "evidence": evidence,
+        "evidence_text": flatten_parts(evidence),
+    }
 
 
 async def run_retrieval_route(
@@ -122,7 +123,7 @@ async def _try_run_small_corpus_route(
         "namespace": context.namespace,
         "query": context.query,
         "router_used": "small_corpus_all",
-        "evidence_text": _render_rows_evidence(results),
+        **_evidence_fields(results),
         "answer_text": "",
         "results": results,
     }
@@ -179,7 +180,7 @@ async def _run_classic_topk_route(
         "namespace": context.namespace,
         "query": context.query,
         "router_used": "classic_topk",
-        "evidence_text": _render_rows_evidence(results),
+        **_evidence_fields(results),
         "answer_text": "",
         "results": results,
     }
@@ -200,7 +201,10 @@ async def _run_agent_explore_route(
     Which provider actually runs the tool-calling loop is the
     ``AGENT_EXPLORE_HARNESS`` switch resolved by ``resolve_harness()``.
     """
-    from shared.services.retrieval.agent_explore.bridge import build_decision_trace
+    from shared.services.retrieval.agent_explore.bridge import (
+        attach_ref_provenance,
+        build_decision_trace,
+    )
     from shared.services.retrieval.agent_explore.budget import EpisodeBudget
     from shared.services.retrieval.agent_explore.harness import resolve_harness
     from shared.services.retrieval.agent_explore.ref_resolution import (
@@ -214,10 +218,10 @@ async def _run_agent_explore_route(
     # be reused for post-episode database work.
     await context.db.rollback()
 
-    harness = resolve_harness()
+    harness = resolve_harness(cursor_model=context.agent_explore_model)
     episode_started = time.perf_counter()
     episode = await harness.run_episode(
-        db_factory=open_fresh_database_context,
+        db_factory=open_agent_explore_database_context,
         user_id=context.user_id,
         namespace=context.namespace,
         query=context.query,
@@ -239,15 +243,22 @@ async def _run_agent_explore_route(
     # sees in tool text); resolve_workflow_references requires chunk_id —
     # see ref_resolution.py's module docstring for why this bridge exists.
     decision_steps = build_decision_trace(episode.steps)
-    decision_trace = [step.to_dict() for step in decision_steps]
 
     async with open_fresh_database_context() as final_db:
-        chunk_refs = await resolve_finish_refs(
+        finish_resolution = await resolve_finish_refs(
             final_db,
             user_id=context.user_id,
             namespace=context.namespace,
             refs=episode.refs,
             document_scope=context.document_scope,
+        )
+        chunk_refs = finish_resolution.resolved
+        decision_steps = attach_ref_provenance(
+            decision_steps,
+            agent_selected_refs=episode.agent_selected_refs,
+            fallback_refs=episode.fallback_refs,
+            resolved_refs=chunk_refs,
+            dropped_refs=finish_resolution.dropped,
         )
         resolved = await resolve_workflow_references(
             db=final_db,
@@ -291,12 +302,13 @@ async def _run_agent_explore_route(
             selected_doc_ids=selected_doc_ids,
         )
 
-    evidence_text = _render_rows_evidence(assembled_rows)
+    decision_trace = [step.to_dict() for step in decision_steps]
+    evidence_fields = _evidence_fields(assembled_rows)
     response = {
         "namespace": context.namespace,
         "query": context.query,
         "router_used": "agent_explore",
-        "evidence_text": evidence_text,
+        **evidence_fields,
         "answer_text": "",
         "referenced_chunks": resolved.refs,
         "results": assembled_rows,
@@ -309,6 +321,6 @@ async def _run_agent_explore_route(
         completion_label="AGENT EXPLORE RETRIEVAL",
         completion_count=len(resolved.refs),
         completion_detail=(
-            f"chunks | evidence={len(evidence_text)} chars | router=agent_explore"
+            f"chunks | evidence={len(evidence_fields['evidence_text'])} chars | router=agent_explore"
         ),
     )

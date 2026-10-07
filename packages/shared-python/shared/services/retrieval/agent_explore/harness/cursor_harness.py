@@ -84,9 +84,13 @@ from shared.services.retrieval.agent_explore.dispatch import DbFactory, dispatch
 from shared.services.retrieval.agent_explore.shared import (
     EVIDENCE_TOOL_NAMES,
     budget_status_line,
-    dedup_refs,
-    normalize_finish_refs,
+    cursor_execute_content,
+    finish_refs_from_args,
+    invalid_finish_message,
+    read_ref_status,
+    select_episode_refs,
     tool_message_content,
+    validate_finish_args,
     wire_safe_tool_name,
 )
 from shared.services.retrieval.agent_explore.types import AgentStep, EpisodeResult
@@ -129,7 +133,8 @@ class CursorHarness:
     """``Harness`` implementation over the Cursor SDK local agent."""
 
     def __init__(self, *, model: str | None = None) -> None:
-        self._model = model or AGENT_EXPLORE_CURSOR_MODEL
+        env_model = os.environ.get("AGENT_EXPLORE_CURSOR_MODEL", "").strip()
+        self._model = model or env_model or AGENT_EXPLORE_CURSOR_MODEL
 
     async def run_episode(
         self,
@@ -163,14 +168,14 @@ class CursorHarness:
 
         steps: list[AgentStep] = []
         trajectory_refs: list[dict[str, Any]] = []
-        # None until finish is actually called — distinguishes "finish
-        # called with an empty refs list" (respect it) from "finish never
-        # called" (fall back to trajectory_refs below), same contract as
-        # openai_harness.py's normalize_finish_refs + fallback.
+        # None until finish specifies refs. Explicit ``refs: []`` stays [].
+        # Omitted refs still fall back via select_episode_refs.
         finish_state: dict[str, Any] = {"refs": None, "notes": ""}
         stop_reason = "finished"
 
-        def _dispatch_sync(tool_name: str, args: dict[str, Any]) -> str:
+        def _dispatch_sync(
+            tool_name: str, args: dict[str, Any]
+        ) -> str | list[dict[str, Any]]:
             with budget_lock:
                 if budget.steps_used >= budget.max_steps:
                     steps.append(
@@ -197,6 +202,7 @@ class CursorHarness:
                     namespace=namespace,
                     document_scope=document_scope,
                     budget=tool_budget,
+                    query=query,
                 ),
                 loop,
             )
@@ -205,12 +211,19 @@ class CursorHarness:
             except Exception as exc:  # noqa: BLE001 - one broken tool must not kill the episode
                 tool_result = ToolResult(text="", error=f"{type(exc).__name__}: {exc}")
             elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
-            content = tool_message_content(tool_result, max_chars=tool_budget.max_chars)
+            content = tool_message_content(
+                tool_result,
+                tool_name=tool_name,
+                max_chars=tool_budget.max_chars,
+            )
             # Appended per call, unlike openai_harness.py's once-per-turn
             # placement — this harness has no batched-turn concept exposed to
             # the host process (see module docstring): each corpus.* dispatch
             # is the only per-step hook available to surface budget state.
             content_with_budget = content + "\n" + budget_status_line(budget)
+            observation = cursor_execute_content(
+                tool_result, text=content_with_budget
+            )
             steps.append(
                 AgentStep(
                     step_index=len(steps),
@@ -221,18 +234,21 @@ class CursorHarness:
                     elapsed_ms=elapsed_ms,
                     tokens_used_delta=0,
                     tokens_used_total=budget.tokens_used,
+                    ref_status=read_ref_status(tool_name, tool_result),
                 )
             )
             if tool_name in EVIDENCE_TOOL_NAMES and not tool_result.error:
                 trajectory_refs.extend(tool_result.refs)
-            return content_with_budget
+            return observation
 
         custom_tools: dict[str, Any] = {}
         for spec in REGISTRY.all():
             wire_name = wire_safe_tool_name(spec.name)
 
             def _make_execute(resolved_name: str):
-                def execute(args: dict[str, Any], _ctx: Any) -> str:
+                def execute(
+                    args: dict[str, Any], _ctx: Any
+                ) -> str | list[dict[str, Any]]:
                     return _dispatch_sync(resolved_name, dict(args or {}))
 
                 return execute
@@ -244,9 +260,44 @@ class CursorHarness:
             )
 
         def finish_execute(args: dict[str, Any], _ctx: Any) -> str:
-            finish_state["refs"] = normalize_finish_refs(args.get("refs"))
-            finish_state["notes"] = str(args.get("notes") or "")
-            return json.dumps({"status": "finished", "refs": len(finish_state["refs"])})
+            args = dict(args or {})
+            validation_error = validate_finish_args(args)
+            if validation_error is not None:
+                with budget_lock:
+                    steps.append(
+                        AgentStep(
+                            step_index=len(steps),
+                            tool_name=FINISH_TOOL_NAME,
+                            tool_args=args,
+                            observation_text=validation_error,
+                            error=validation_error,
+                            elapsed_ms=0,
+                            tokens_used_delta=0,
+                            tokens_used_total=budget.tokens_used,
+                        )
+                    )
+                return json.dumps(
+                    {"status": "error", "error": invalid_finish_message(validation_error)}
+                )
+            selected = finish_refs_from_args(args)
+            cited = selected if selected is not None else []
+            notes = str(args.get("notes") or "")
+            with budget_lock:
+                finish_state["refs"] = selected
+                finish_state["notes"] = notes
+                steps.append(
+                    AgentStep(
+                        step_index=len(steps),
+                        tool_name=FINISH_TOOL_NAME,
+                        tool_args=args,
+                        observation_text=f"refs={len(cited)} notes={notes!r}",
+                        error=None,
+                        elapsed_ms=0,
+                        tokens_used_delta=0,
+                        tokens_used_total=budget.tokens_used,
+                    )
+                )
+            return json.dumps({"status": "finished", "refs": len(cited)})
 
         custom_tools[FINISH_TOOL_NAME] = cursor_sdk.CustomTool(
             execute=finish_execute,
@@ -295,23 +346,18 @@ class CursorHarness:
             result_usage_total_tokens = result.usage.total_tokens
         budget.record_usage({"total_tokens": result_usage_total_tokens})
 
-        result_refs = finish_state["refs"]
-        result_notes = str(finish_state["notes"] or "")
-        if not result_refs:
-            fallback_refs = dedup_refs(trajectory_refs)
-            if fallback_refs:
-                result_refs = fallback_refs
-                result_notes = (result_notes + " " if result_notes else "") + (
-                    "[refs auto-filled from corpus.read/corpus.assets trajectory; "
-                    "finish did not cite any]"
-                )
-        result_refs = result_refs or []
-
+        selection = select_episode_refs(
+            finish_state["refs"],
+            trajectory_refs,
+            str(finish_state["notes"] or ""),
+        )
         return EpisodeResult(
-            refs=result_refs,
-            notes=result_notes,
+            refs=selection.refs,
+            notes=selection.notes,
             steps=steps,
             stop_reason=stop_reason,
             tokens_used=budget.tokens_used,
             model_name=self._model,
+            agent_selected_refs=selection.agent_selected_refs,
+            fallback_refs=selection.fallback_refs,
         )

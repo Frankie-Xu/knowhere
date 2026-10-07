@@ -7,11 +7,13 @@ without reading any chunk content.
 
 from __future__ import annotations
 
+from shared.services.retrieval.corpus_storage import CorpusStorage
+from shared.services.retrieval.corpus_revision_context import CorpusRevisionContext
+
 from typing import Any
 
 from sqlalchemy import select
 
-from shared.models.database.document import Document, GraphNode
 from shared.services.retrieval.agent_tools.registry import (
     ToolContext,
     ToolResult,
@@ -24,29 +26,32 @@ from shared.services.retrieval.agent_tools.registry import (
     description=(
         "List every active document in the namespace with its parse_track "
         "and, when available, document-level graph metadata (top_keywords, "
-        "top_summary, chunk type mix). Use this to start cold: which "
-        "documents exist and what are they about, before picking one for "
-        "outline/node_filter/recall/read."
+        "top_summary, chunk type mix). Use only when explicitly asked to "
+        "inventory the namespace's documents, not as a first step for "
+        "question answering."
     ),
     json_schema={
         "type": "object",
         "properties": {},
         "required": [],
+        "additionalProperties": False,
     },
 )
 async def list_documents(ctx: ToolContext, _args: dict[str, Any]) -> ToolResult:
+    corpusStorage: CorpusStorage = CorpusStorage.resolve_namespace(ctx.namespace)
     stmt = (
-        select(Document, GraphNode.properties)
+        select(corpusStorage.Document, corpusStorage.GraphNode.properties)
         .outerjoin(
-            GraphNode,
-            (GraphNode.owner_document_id == Document.document_id)
-            & (GraphNode.node_kind == "document"),
+            corpusStorage.GraphNode,
+            (corpusStorage.GraphNode.owner_document_id == corpusStorage.Document.document_id)
+            & (corpusStorage.GraphNode.node_kind == "document")
+            & (corpusStorage.GraphNode.job_result_id == CorpusRevisionContext.build_revision_column(corpusStorage.Document)),
         )
-        .where(Document.user_id == ctx.user_id)
-        .where(Document.namespace == ctx.namespace)
-        .where(Document.status == "active")
-        .where(ctx.document_scope.predicate(Document.document_id))
-        .order_by(Document.source_file_name)
+        .where(corpusStorage.Document.user_id == corpusStorage.resolve_owner(ctx.user_id))
+        .where(corpusStorage.Document.namespace == ctx.namespace)
+        .where(corpusStorage.Document.status == "active")
+        .where(ctx.document_scope.predicate(corpusStorage.Document.document_id))
+        .order_by(corpusStorage.Document.source_file_name)
     )
     rows = (await ctx.db.execute(stmt)).all()
 
@@ -56,6 +61,7 @@ async def list_documents(ctx: ToolContext, _args: dict[str, Any]) -> ToolResult:
         props = properties if isinstance(properties, dict) else {}
         entry = {
             "document_id": document.document_id,
+            "job_result_id": CorpusRevisionContext.resolve_revision(document.document_id, document.current_job_result_id),
             "source_file_name": document.source_file_name,
             "parse_track": document.parse_track,
             "top_keywords": props.get("top_keywords") or [],

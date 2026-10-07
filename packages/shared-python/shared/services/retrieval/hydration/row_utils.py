@@ -8,6 +8,7 @@ from shared.services.retrieval.search.section_filters import is_excluded_section
 
 MEDIA_CHUNK_TYPES = {'image', 'table'}
 PUBLIC_RESULT_FIELDS = {
+    'job_result_id',
     'chunk_id',
     'chunk_type',
     'content',
@@ -18,7 +19,7 @@ PUBLIC_RESULT_FIELDS = {
     'file_path',
 }
 PUBLIC_SOURCE_FIELDS = {
-    'document_id', 'source_file_name', 'section_path', 'page_nums',
+    'document_id', 'source_file_name', 'section_path', 'page_nums', 'job_result_id',
 }
 
 ReferenceLookupKey = tuple[str, str, str, str]
@@ -38,6 +39,13 @@ def extract_page_nums(row: dict[str, Any]) -> list[int] | None:
         return None
     page_nums = metadata.get('page_nums')
     return page_nums if isinstance(page_nums, list) else None
+
+
+def page_summary(row: dict[str, Any]) -> str:
+    metadata = row.get('chunk_metadata') or row.get('metadata') or {}
+    if not isinstance(metadata, dict):
+        return ''
+    return str(metadata.get('summary') or '').strip()
 
 
 def build_reference_lookup_key(

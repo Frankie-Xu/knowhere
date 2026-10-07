@@ -27,7 +27,7 @@ collapsing (fix 1), which stays here — it mutates this harness's own
 ``messages: list[dict]`` history, a mechanism the Cursor SDK harness has no
 equivalent hook for:
 
-1. **Stale tool-message collapsing** (``_TOOL_MESSAGE_FRESH_TURNS``,
+1. **Stale discovery-message collapsing** (``_TOOL_MESSAGE_FRESH_TURNS``,
    ``_collapse_stale_tool_messages``): ``messages`` only ever appended, so a
    single ``corpus.outline``/``corpus.node_filter`` call (each capped at
    ``ToolBudget.max_chars`` — currently ``EVIDENCE_TEXT_CHAR_BUDGET=12_000``,
@@ -36,17 +36,16 @@ equivalent hook for:
    ``RETRIEVAL_NAV_TOKEN_LIMIT`` (100k default) within 7-8 LLM turns from
    this resend alone, not from query difficulty — per-turn token cost grew
    monotonically (q04: 4.4k -> 4.8k -> 19.8k -> 21.5k -> 24.2k -> 29.6k).
-2. **Trajectory refs fallback** (``shared.dedup_refs`` + the fallback at the
-   end of ``run_episode``): verified live that ``finish`` can be called with
-   no ``refs`` key at all (raw ``function.arguments`` was literally ``'{}'``)
-   even after the model had already read clearly relevant sections via
-   ``corpus.read`` — the ``FINISH_TOOL_SCHEMA``'s ``"required": ["refs"]`` is
-   a schema hint, not a provider-enforced constraint. When ``finish``'s own
-   ``refs`` end up empty (whether from this, from ``no_tool_call``, or from a
-   forced-finish the provider ignored — all three exit paths), the episode
-   now falls back to the refs already returned by every
-   ``corpus.read``/``corpus.assets`` call in the trajectory, deduped, instead
-   of citing nothing.
+   Successful evidence reads remain visible until finish. Removing them after
+   two turns caused a real SpaceX query to alternate between complementary
+   sections until its token budget ran out. Per-result text caps and the
+   episode budget still apply.
+2. **Trajectory refs fallback** (``shared.select_episode_refs``): verified
+   live that ``finish`` can be called with no ``refs`` key at all (raw
+   ``function.arguments`` was literally ``'{}'``) even after the model had
+   already read clearly relevant sections via ``corpus.read``. Omitted refs
+   (``None``) still fall back to ``corpus.read``/``corpus.assets`` trajectory
+   refs. An explicit ``refs: []`` is respected and does not fall back.
 """
 
 from __future__ import annotations
@@ -72,15 +71,25 @@ from shared.services.retrieval.agent_explore.shared import (
     EVIDENCE_TOOL_NAMES,
     budget_status_line,
     build_wire_tool_name_map,
-    dedup_refs,
-    normalize_finish_refs,
+    finish_refs_from_args,
+    https_image_parts,
+    invalid_finish_message,
+    model_accepts_images,
+    read_ref_status,
+    select_episode_refs,
     tool_message_content,
+    validate_finish_args,
     wire_safe_tool_name,
 )
 from shared.services.retrieval.agent_explore.types import AgentStep, EpisodeResult
-from shared.services.retrieval.agent_tools import REGISTRY, ToolBudget, load_corpus_schema_text
+from shared.services.retrieval.agent_tools import (
+    REGISTRY,
+    ToolBudget,
+    ToolResult,
+    load_corpus_schema_text,
+)
 
-# A tool-role message is kept in full for the turn it was produced plus this
+# A discovery or failed tool message is kept in full for the turn it was produced plus this
 # many additional turns, then collapsed to a placeholder — see module
 # docstring point 1. Not tuned against a real recall-vs-token tradeoff yet;
 # 2 was chosen so a result stays fully visible for one full turn after the
@@ -132,14 +141,23 @@ def _build_openai_tools() -> tuple[list[dict[str, Any]], dict[str, str]]:
     return tools, name_map
 
 
-def _safe_json_loads(raw: str | None) -> dict[str, Any]:
-    if not raw:
-        return {}
+def _parse_tool_arguments(raw: str | None) -> tuple[dict[str, Any], str | None]:
+    """Parse one tool call's JSON arguments, or return the parse error.
+
+    Only a missing argument string or an explicit ``{}`` is an empty object;
+    an empty string or malformed JSON is an error. Either way the error
+    fails just that one call (a corpus.* tool or ``finish``) and is sent
+    back to the model — the episode continues.
+    """
+    if raw is None:
+        return {}, None
     try:
         parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError) as exc:
+        return {}, f"invalid JSON arguments: {exc}"
+    if not isinstance(parsed, dict):
+        return {}, f"arguments must be a JSON object, got {type(parsed).__name__}"
+    return parsed, None
 
 
 def _collapse_stale_tool_messages(
@@ -149,14 +167,15 @@ def _collapse_stale_tool_messages(
     current_turn: int,
     fresh_turns: int,
 ) -> None:
-    """Replace tool messages older than ``fresh_turns`` with a placeholder.
+    """Replace stale discovery/error messages while preserving read evidence.
 
     ``messages`` only ever grows within one episode (see module docstring
     point 1); this is what keeps that growth bounded instead of resending
-    every past tool result on every later turn.
+    every past discovery result on every later turn. Successful evidence must
+    remain visible so complementary reads can be synthesized without rereading.
     """
     for entry in tool_message_log:
-        if entry["collapsed"]:
+        if entry["collapsed"] or entry.get("has_evidence", False):
             continue
         if current_turn - entry["turn_index"] < fresh_turns:
             continue
@@ -192,14 +211,14 @@ class OpenAIHarness:
         ]
 
         steps: list[AgentStep] = []
-        result_refs: list[dict[str, Any]] = []
+        finish_refs: list[dict[str, Any]] | None = None
         result_notes = ""
-        # Refs from every corpus.read/corpus.assets call this episode, in call
+        # Refs from every corpus.read/corpus.assets/corpus.query_table call this episode, in call
         # order — the fallback source when finish's own refs end up empty (see
         # module docstring point 2).
         trajectory_refs: list[dict[str, Any]] = []
         # One entry per appended tool-role message: {message_index, turn_index,
-        # tool_name, original_chars, collapsed} — see _collapse_stale_tool_messages.
+        # tool_name, original_chars, has_evidence, collapsed} — see _collapse_stale_tool_messages.
         tool_message_log: list[dict[str, Any]] = []
         turn_index = 0
 
@@ -255,18 +274,27 @@ class OpenAIHarness:
             finish_call = next(
                 (tc for tc in tool_calls if tc.function.name == FINISH_TOOL_NAME), None
             )
+            finish_error: str | None = None
             if finish_call is not None:
-                args = _safe_json_loads(finish_call.function.arguments)
-                result_refs = normalize_finish_refs(args.get("refs"))
-                result_notes = str(args.get("notes") or "")
+                args, parse_error = _parse_tool_arguments(finish_call.function.arguments)
+                if parse_error is None:
+                    parse_error = validate_finish_args(args)
+                if parse_error is not None and forced_reason is None:
+                    finish_error = parse_error
+            if finish_call is not None and finish_error is None:
+                finish_refs = finish_refs_from_args(args) if parse_error is None else None
+                cited = finish_refs if finish_refs is not None else []
+                result_notes = (
+                    parse_error if parse_error is not None else str(args.get("notes") or "")
+                )
                 stop_reason = f"budget_{forced_reason}" if forced_reason else "finished"
                 steps.append(
                     AgentStep(
                         step_index=len(steps),
                         tool_name=FINISH_TOOL_NAME,
                         tool_args=args,
-                        observation_text=f"refs={len(result_refs)} notes={result_notes!r}",
-                        error=None,
+                        observation_text=f"refs={len(cited)} notes={result_notes!r}",
+                        error=parse_error,
                         elapsed_ms=turn_elapsed_ms,
                         tokens_used_delta=turn_tokens,
                         tokens_used_total=budget.tokens_used,
@@ -316,29 +344,53 @@ class OpenAIHarness:
             first_tool_tokens_recorded = False
             for tc in tool_calls:
                 tool_started = time.perf_counter()
-                args = _safe_json_loads(tc.function.arguments)
+                args, parse_error = _parse_tool_arguments(tc.function.arguments)
                 requested_name = str(tc.function.name or "")
                 canonical_name = tool_name_map.get(requested_name, requested_name)
-                tool_result = await dispatch_tool_call(
-                    canonical_name,
-                    args,
-                    db_factory=db_factory,
-                    user_id=user_id,
-                    namespace=namespace,
-                    document_scope=document_scope,
-                    budget=tool_budget,
-                )
+                if tc is finish_call:
+                    tool_result = ToolResult(
+                        text="", error=invalid_finish_message(str(finish_error))
+                    )
+                elif parse_error is not None:
+                    tool_result = ToolResult(text="", error=parse_error)
+                else:
+                    tool_result = await dispatch_tool_call(
+                        canonical_name,
+                        args,
+                        db_factory=db_factory,
+                        user_id=user_id,
+                        namespace=namespace,
+                        document_scope=document_scope,
+                        budget=tool_budget,
+                        query=query,
+                    )
                 tool_elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
-                content = tool_message_content(tool_result, max_chars=tool_budget.max_chars)
+                content = tool_message_content(
+                    tool_result,
+                    tool_name=canonical_name,
+                    max_chars=tool_budget.max_chars,
+                )
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
+                tool_message_index = len(messages) - 1
+                if model_accepts_images(model):
+                    image_parts = https_image_parts(tool_result)
+                    if image_parts:
+                        messages.append(
+                            {"role": "user", "content": image_parts}
+                        )
                 tool_message_log.append(
                     {
-                        "message_index": len(messages) - 1,
+                        "message_index": tool_message_index,
                         "turn_index": turn_index,
                         "tool_name": canonical_name,
                         "original_chars": len(content),
+                        "has_evidence": (
+                            canonical_name in EVIDENCE_TOOL_NAMES
+                            and not tool_result.error
+                            and bool(tool_result.refs)
+                        ),
                         "collapsed": False,
                     }
                 )
@@ -361,6 +413,7 @@ class OpenAIHarness:
                         ),
                         tokens_used_delta=0 if first_tool_tokens_recorded else turn_tokens,
                         tokens_used_total=budget.tokens_used,
+                        ref_status=read_ref_status(canonical_name, tool_result),
                     )
                 )
                 first_tool_tokens_recorded = True
@@ -369,24 +422,27 @@ class OpenAIHarness:
             # every AgentStep's recorded observation_text above) — the model
             # only needs to see current remaining budget once before its next
             # completion call, not once per parallel tool call in this turn.
-            messages[-1]["content"] = (
-                str(messages[-1]["content"]) + "\n" + budget_status_line(budget)
+            last_tool = next(
+                (
+                    message
+                    for message in reversed(messages)
+                    if message.get("role") == "tool"
+                ),
+                None,
             )
-
-        if not result_refs:
-            fallback_refs = dedup_refs(trajectory_refs)
-            if fallback_refs:
-                result_refs = fallback_refs
-                result_notes = (result_notes + " " if result_notes else "") + (
-                    "[refs auto-filled from corpus.read/corpus.assets trajectory; "
-                    "finish did not cite any]"
+            if last_tool is not None:
+                last_tool["content"] = (
+                    str(last_tool["content"]) + "\n" + budget_status_line(budget)
                 )
 
+        selection = select_episode_refs(finish_refs, trajectory_refs, result_notes)
         return EpisodeResult(
-            refs=result_refs,
-            notes=result_notes,
+            refs=selection.refs,
+            notes=selection.notes,
             steps=steps,
             stop_reason=stop_reason,
             tokens_used=budget.tokens_used,
             model_name=model,
+            agent_selected_refs=selection.agent_selected_refs,
+            fallback_refs=selection.fallback_refs,
         )

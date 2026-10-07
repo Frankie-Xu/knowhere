@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from shared.services.retrieval.document_scope import DocumentScope
 
+import asyncio
 import json
 import time
 from collections.abc import Mapping
@@ -25,6 +26,7 @@ from typing import Any, cast
 
 from loguru import logger
 from sqlalchemy import text
+from shared.services.retrieval.corpus_storage import CorpusStorage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.services.retrieval.hydration.connected import hydrate_connected_target_rows
@@ -50,6 +52,30 @@ from shared.services.retrieval.settings import ASSET_CHUNK_TYPES
 
 _MAP_SCORE_CHANNELS = ("path", "content")
 
+
+def _schedule_index_readiness(
+    *,
+    user_id: str,
+    namespace: str,
+    ready: bool,
+    expected_revisions: int,
+    indexed_revisions: int,
+) -> None:
+    async def _publish() -> None:
+        try:
+            await record_retrieval_index_readiness(
+                user_id=user_id,
+                namespace=namespace,
+                ready=ready,
+                expected_revisions=expected_revisions,
+                indexed_revisions=indexed_revisions,
+            )
+        except Exception as exc:
+            logger.warning("retrieval index readiness publish failed: %s", exc)
+
+    asyncio.get_running_loop().create_task(_publish())
+
+
 _SCOPED_UNITS_CTE = """
 WITH scoped_units AS (
     SELECT
@@ -73,6 +99,7 @@ WITH scoped_units AS (
         {document_scope_clause}
         {type_clause}
         {signal_clause}
+        {section_clause}
 )
 """
 
@@ -164,6 +191,36 @@ def _build_signal_clause(
     return clause, params
 
 
+def _build_section_subtree_clause(
+    targets: list[tuple[str, str | None]] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Restrict units to exact section subtrees. Empty when no target names a path.
+
+    Whole-document targets stay ``document_id`` only. A named path is that
+    section and everything under it (``path = X OR path LIKE 'X / %'``), not
+    a substring match.
+    """
+    if not targets or not any(section_path for _document_id, section_path in targets):
+        return "", {}
+    parts: list[str] = []
+    params: dict[str, Any] = {}
+    for index, (document_id, section_path) in enumerate(targets):
+        doc_key = f"_sec_doc_{index}"
+        params[doc_key] = document_id
+        if not section_path:
+            parts.append(f"(dmu.document_id = :{doc_key})")
+            continue
+        path_key = f"_sec_path_{index}"
+        like_key = f"_sec_pathlike_{index}"
+        params[path_key] = section_path
+        params[like_key] = f"{section_path} / %"
+        parts.append(
+            f"(dmu.document_id = :{doc_key} AND "
+            f"(ds.section_path = :{path_key} OR ds.section_path LIKE :{like_key}))"
+        )
+    return f"AND ({' OR '.join(parts)})", params
+
+
 async def map_unit_discovery(
     db: AsyncSession | None,
     *,
@@ -178,9 +235,12 @@ async def map_unit_discovery(
     signal_paths: list[str] | None = None,
     filter_mode: str = "delete",
     revision_pins: Mapping[str, str] | None = None,
+    publish_index_readiness: bool = True,
+    section_targets: list[tuple[str, str | None]] | None = None,
     **_kwargs: Any,
 ) -> DiscoveryResult:
     """Score the whole in-scope corpus via the persisted map-unit BM25 scorer."""
+    corpusStorage: CorpusStorage = CorpusStorage.resolve_namespace(namespace)
     t0 = time.monotonic()
     if db is None:
         raise ValueError("database session required for map_unit_discovery")
@@ -190,7 +250,7 @@ async def map_unit_discovery(
     if revision_pins is not None and not revision_pins:
         return DiscoveryResult(status="discovery_done", payload={"fused_rows": []})
     query_token_hashes = [
-        sha256(token.encode("utf-8")).hexdigest() for token in query_tokens
+        sha256(token.encode("utf-8")).digest() for token in query_tokens
     ]
 
     revision_join, revision_clause, revision_params = _build_revision_scope(
@@ -202,22 +262,28 @@ async def map_unit_discovery(
     signal_clause, signal_params = _build_signal_clause(
         signal_paths or [], filter_mode
     )
-    params: dict[str, Any] = {"user_id": user_id, "namespace": namespace}
+    section_clause, section_params = _build_section_subtree_clause(section_targets)
+    params: dict[str, Any] = {"user_id": corpusStorage.resolve_owner(user_id), "namespace": namespace}
     params.update(revision_params)
     params.update(document_scope_params)
     params.update(type_params)
     params.update(signal_params)
+    params.update(section_params)
 
     is_unfiltered_scope: bool = not any(
         (
             chunk_types,
             signal_paths,
+            section_clause,
             exclude_sections,
             exclude_document_ids,
-            document_scope.include is not None,
+            document_scope.include is not None and (
+                revision_pins is None or set(document_scope.include) != set(revision_pins)
+            ),
             document_scope.exclude,
         )
     )
+    uses_section_join = bool(signal_paths or section_clause)
 
     cte = _SCOPED_UNITS_CTE.format(
         revision_join=revision_join,
@@ -225,13 +291,15 @@ async def map_unit_discovery(
         document_scope_clause=document_scope_clause,
         type_clause=type_clause,
         signal_clause=signal_clause,
+        section_clause=section_clause,
     )
     unit_statement = cte + "SELECT * FROM scoped_units"
     if is_unfiltered_scope:
         unit_statement = (
             "WITH matching_tokens AS MATERIALIZED ("
             "SELECT DISTINCT map_unit_id FROM document_map_unit_tokens "
-            "WHERE channel = ANY(:channels) AND token_hash = ANY(:token_hashes)"
+            "WHERE channel = ANY(:channels) "
+            "AND decode(token_hash, 'hex') = ANY(:token_hashes)"
             "), "
             + cte.lstrip().removeprefix("WITH ")
             + " SELECT DISTINCT scoped_units.* "
@@ -244,7 +312,7 @@ async def map_unit_discovery(
             "token_hashes": query_token_hashes,
         }
     stage_started = time.monotonic()
-    unit_result = await db.execute(text(unit_statement), params)
+    unit_result = await db.execute(text(corpusStorage.compile_sql(unit_statement)), params)
     unit_rows = [dict(row._mapping) for row in unit_result.all()]
     unit_rows = [
         row
@@ -261,18 +329,18 @@ async def map_unit_discovery(
         len(unit_rows),
     )
 
-    frequency_scope_cte = cte if signal_paths else _SCOPED_UNIT_IDS_CTE.format(
+    frequency_scope_cte = cte if uses_section_join else _SCOPED_UNIT_IDS_CTE.format(
         revision_join=revision_join,
         revision_clause=revision_clause,
         document_scope_clause=document_scope_clause,
         type_clause=type_clause,
     )
     frequency_query = text(
-        "WITH matching_tokens AS MATERIALIZED ("
+        corpusStorage.compile_sql("WITH matching_tokens AS MATERIALIZED ("
         "SELECT map_unit_id, channel, token, frequency "
         "FROM document_map_unit_tokens "
         "WHERE channel = ANY(:channels) "
-        "AND token_hash = ANY(:token_hashes)"
+        "AND decode(token_hash, 'hex') = ANY(:token_hashes)"
         "), "
         + frequency_scope_cte.lstrip().removeprefix("WITH ")
         + """
@@ -281,7 +349,7 @@ async def map_unit_discovery(
                 FROM matching_tokens
                 JOIN scoped_units
                     ON scoped_units.map_unit_id = matching_tokens.map_unit_id
-                """
+                """)
     )
     stage_started = time.monotonic()
     frequency_result = await db.execute(
@@ -330,7 +398,7 @@ async def map_unit_discovery(
         index_statement = (
             (
                 cte
-                if signal_paths
+                if uses_section_join
                 else _SCOPED_UNIT_IDS_CTE.format(
                     revision_join=revision_join,
                     revision_clause=revision_clause,
@@ -353,7 +421,7 @@ async def map_unit_discovery(
                 """
         )
     stage_started = time.monotonic()
-    index_result = await db.execute(text(index_statement), params)
+    index_result = await db.execute(text(corpusStorage.compile_sql(index_statement)), params)
     index_parts = [
         (
             float(path_idf or 0.0),
@@ -397,7 +465,7 @@ async def map_unit_discovery(
         else:
             stage_started = time.monotonic()
             revision_result = await db.execute(
-                text(cte + "SELECT DISTINCT document_id, job_result_id FROM scoped_units"),
+                text(corpusStorage.compile_sql(cte + "SELECT DISTINCT document_id, job_result_id FROM scoped_units")),
                 params,
             )
             expected_revisions = {
@@ -424,7 +492,7 @@ async def map_unit_discovery(
             (
                 await db.execute(
                     text(
-                        _SCOPED_UNIT_IDS_CTE.format(
+                        corpusStorage.compile_sql(_SCOPED_UNIT_IDS_CTE.format(
                             revision_join=revision_join,
                             revision_clause=revision_clause,
                             document_scope_clause=document_scope_clause,
@@ -439,7 +507,7 @@ async def map_unit_discovery(
                                 JOIN scoped_units
                                     ON scoped_units.map_unit_id = tokens.map_unit_id
                             ) AS token_count
-                        """
+                        """)
                     ),
                     params,
                 )
@@ -457,7 +525,7 @@ async def map_unit_discovery(
     # undercount check used for unfiltered token projection.
     has_index_unit_count_mismatch = (
         indexed_unit_count < len(unit_rows)
-        if is_unfiltered_scope or type_clause or signal_paths or exclude_sections
+        if is_unfiltered_scope or type_clause or signal_paths or section_clause or exclude_sections
         else indexed_unit_count != len(unit_rows)
     )
     is_index_format_incompatible = any(
@@ -500,16 +568,14 @@ async def map_unit_discovery(
         or is_index_format_incompatible
     )
     if has_unusable_index:
-        try:
-            await record_retrieval_index_readiness(
+        if publish_index_readiness:
+            _schedule_index_readiness(
                 user_id=user_id,
                 namespace=namespace,
                 ready=False,
                 expected_revisions=len(expected_revisions),
                 indexed_revisions=len(index_parts),
             )
-        except Exception as exc:
-            logger.warning("retrieval index readiness publish failed: %s", exc)
         if has_revision_coverage_mismatch:
             unusable_reason = "revision_coverage"
         elif is_index_format_incompatible:
@@ -547,7 +613,7 @@ async def map_unit_discovery(
             if key not in {"channels", "token_hashes"}
         }
         full_unit_result = await db.execute(
-            text(cte + "SELECT * FROM scoped_units"), full_unit_params
+            text(corpusStorage.compile_sql(cte + "SELECT * FROM scoped_units")), full_unit_params
         )
         unit_rows = [dict(row._mapping) for row in full_unit_result.all()]
         unit_rows = [
@@ -564,16 +630,14 @@ async def map_unit_discovery(
             time.monotonic() - stage_started,
             len(unit_rows),
         )
-    try:
-        await record_retrieval_index_readiness(
+    if publish_index_readiness:
+        _schedule_index_readiness(
             user_id=user_id,
             namespace=namespace,
             ready=not has_incomplete_index_statistics,
             expected_revisions=len(expected_revisions),
             indexed_revisions=len(index_parts),
         )
-    except Exception as exc:
-        logger.warning("retrieval index readiness publish failed: %s", exc)
     average_idf_path = combine_average_idf(
         [
             (path_idf, unit_count)
@@ -724,6 +788,7 @@ async def _hydrate_winning_units(
     revision_pins: Mapping[str, str] | None,
 ) -> list[dict[str, Any]]:
     """Map each winning leaf to its one chunk; asset requests follow connect_to."""
+    corpusStorage: CorpusStorage = CorpusStorage.resolve_document(str(next(iter(rows_by_unit_id.values()), {}).get("document_id") or ""))
     if not ranked_unit_ids:
         return []
 
@@ -739,10 +804,11 @@ async def _hydrate_winning_units(
 
     result = await session.execute(
         text(
-            "SELECT dc.chunk_id, dc.document_id, dc.section_id, dc.chunk_type, "
+            corpusStorage.compile_sql("SELECT dc.chunk_id, dc.document_id, dc.section_id, dc.chunk_type, "
             "dc.content, dc.source_chunk_path, dc.file_path, dc.chunk_metadata, "
             "dc.job_result_id, dc.sort_order, ds.section_path, d.source_file_name, "
-            "jr.job_id "
+            "jr.job_id, "
+            "jr.document_metadata ->> 'result_raw_prefix' AS result_raw_prefix "
             "FROM document_chunks dc "
             "JOIN documents d ON d.document_id = dc.document_id "
             "LEFT JOIN document_sections ds ON ds.section_id = dc.section_id "
@@ -750,7 +816,7 @@ async def _hydrate_winning_units(
             "WHERE dc.document_id = ANY(:document_ids) "
             "AND dc.job_result_id = ANY(:job_result_ids) "
             "AND dc.section_id = ANY(:section_ids) "
-            "ORDER BY dc.sort_order, dc.chunk_id"
+            "ORDER BY dc.sort_order, dc.chunk_id")
         ),
         {
             "document_ids": document_ids,
