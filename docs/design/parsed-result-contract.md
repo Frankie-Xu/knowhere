@@ -25,6 +25,9 @@ New successful packages require all three roots. Navigation generation failure,
 which previously logged a warning and omitted `doc_nav.json`, now fails the
 package. The already enriched navigation is retained, including extension fields
 such as `top_summary`; no on-disk corpus files are rewritten.
+Missing, unreadable, or unrecognized navigation keeps the existing rebuild
+fallback. A readable object claiming an unsupported `schema_version` fails before
+that fallback, even when its section layout is not recognized.
 
 Multiple chunks may reference the same image, table, or page asset. The writer
 stores one ZIP member per asset path. Repeated paths with different contents

@@ -162,10 +162,15 @@ def test_repeated_image_reference_writes_one_asset_member(tmp_path):
     validate_parse_result_archive(path, allow_legacy=False)
 
 
-def test_explicit_unsupported_navigation_version_is_not_relabelled(tmp_path):
+@pytest.mark.parametrize("sections", ["existing", None, "missing"])
+def test_explicit_unsupported_navigation_version_is_not_relabelled(tmp_path, sections):
     fixtures = Path(__file__).parent / "fixtures" / "parse_result"
     nav = json.loads((fixtures / "doc_nav.json").read_text())
     nav["schema_version"] = 2
+    if sections is None:
+        nav["sections"] = None
+    elif sections == "missing":
+        nav.pop("sections")
     (tmp_path / "doc_nav.json").write_text(json.dumps(nav))
     writer = Mock()
     with pytest.raises(ParseResultContractException) as error:
@@ -182,4 +187,3 @@ def test_explicit_unsupported_navigation_version_is_not_relabelled(tmp_path):
         error.value.details["violations"][0]["reason"] == "unsupported_schema_version"
     )
     writer.write.assert_not_called()
-
